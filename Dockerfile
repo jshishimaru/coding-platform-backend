@@ -20,7 +20,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /server ./cmd/server
 # Runtime stage
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates g++ libstdc++ musl-dev
+
+# Create a non-root sandbox user for running untrusted code
+RUN adduser -D -u 1001 sandbox
+
+# Create temp directory for sandbox with proper permissions
+RUN mkdir -p /tmp/sandbox && chmod 1777 /tmp/sandbox
 
 COPY --from=builder /server /server
 

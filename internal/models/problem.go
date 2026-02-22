@@ -10,6 +10,7 @@ type Problem struct {
 	Difficulty    string    `json:"difficulty"`
 	TimeLimitMs   int       `json:"time_limit_ms"`
 	MemoryLimitMb int       `json:"memory_limit_mb"`
+	CheckerCode   string    `json:"checker_code,omitempty"`
 	CreatedBy     int       `json:"created_by"`
 	ContestID     *int      `json:"contest_id,omitempty"`
 	Points        *int      `json:"points,omitempty"`
