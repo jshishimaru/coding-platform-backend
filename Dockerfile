@@ -22,6 +22,9 @@ FROM alpine:3.19
 
 RUN apk add --no-cache ca-certificates g++ libstdc++ musl-dev
 
+# Install testlib.h for competitive programming checkers/validators/generators
+RUN wget -q -O /usr/include/testlib.h https://raw.githubusercontent.com/MikeMirzayanov/testlib/master/testlib.h
+
 # Create a non-root sandbox user for running untrusted code
 RUN adduser -D -u 1001 sandbox
 
