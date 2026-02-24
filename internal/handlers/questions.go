@@ -1,14 +1,14 @@
 package handlers
 
 import (
-"context"
-"net/http"
-"strings"
-"time"
+	"context"
+	"net/http"
+	"strings"
+	"time"
 
-"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin"
 
-"github.com/coding-platform/backend/internal/sandbox"
+	"github.com/coding-platform/backend/internal/sandbox"
 )
 
 // ---------- Request / response types ----------
@@ -22,6 +22,7 @@ type CreateQuestionRequest struct {
 	MemoryLimitMb int              `json:"memory_limit_mb"`
 	CheckerCode   string           `json:"checker_code"`
 	TestCases     []CreateTestCase `json:"test_cases" binding:"required"`
+	Tags          []string         `json:"tags"`
 }
 
 type CreateTestCase struct {
@@ -38,6 +39,7 @@ type QuestionSummary struct {
 	TimeLimitMs   int       `json:"time_limit_ms"`
 	MemoryLimitMb int       `json:"memory_limit_mb"`
 	CreatedAt     time.Time `json:"created_at"`
+	Tags          []string  `json:"tags"`
 }
 
 type QuestionDetail struct {
@@ -49,6 +51,7 @@ type QuestionDetail struct {
 	TimeLimitMs   int              `json:"time_limit_ms"`
 	MemoryLimitMb int              `json:"memory_limit_mb"`
 	CreatedAt     time.Time        `json:"created_at"`
+	Tags          []string         `json:"tags"`
 	SampleTests   []SampleTestCase `json:"sample_test_cases"`
 }
 
@@ -67,20 +70,62 @@ type RunSampleRequest struct {
 
 func (h *Handler) QuestionsHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-"status": "ok", "module": "questions",
-"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"status": "ok", "module": "questions",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
 func (h *Handler) ListQuestions(c *gin.Context) {
-	rows, err := h.DB.Query(context.Background(),
-		`SELECT id, title, slug, difficulty, time_limit_ms, memory_limit_mb, created_at
-		 FROM app.problems ORDER BY id`)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-		return
+	// Parse optional tag filter: ?tags=Array,Graph
+	tagFilter := c.Query("tags")
+	var filterTags []string
+	if tagFilter != "" {
+		for _, t := range strings.Split(tagFilter, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				filterTags = append(filterTags, t)
+			}
+		}
 	}
-	defer rows.Close()
+
+	var rows interface {
+		Next() bool
+		Scan(dest ...any) error
+		Close()
+	}
+	var err error
+
+	if len(filterTags) > 0 {
+		// Only return problems that have ALL the requested tags
+		rows2, err2 := h.DB.Query(context.Background(),
+			`SELECT p.id, p.title, p.slug, p.difficulty, p.time_limit_ms, p.memory_limit_mb, p.created_at
+			 FROM app.problems p
+			 WHERE p.id IN (
+			   SELECT pt.problem_id FROM app.problem_tags pt
+			   JOIN app.tags t ON t.id = pt.tag_id
+			   WHERE t.name = ANY($1)
+			   GROUP BY pt.problem_id
+			   HAVING COUNT(DISTINCT t.name) = $2
+			 )
+			 ORDER BY p.id`, filterTags, len(filterTags))
+		if err2 != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+			return
+		}
+		rows = rows2
+		defer rows2.Close()
+	} else {
+		rows2, err2 := h.DB.Query(context.Background(),
+			`SELECT id, title, slug, difficulty, time_limit_ms, memory_limit_mb, created_at
+			 FROM app.problems ORDER BY id`)
+		if err2 != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+			return
+		}
+		rows = rows2
+		defer rows2.Close()
+	}
+	_ = err
 
 	questions := make([]QuestionSummary, 0)
 	for rows.Next() {
@@ -89,13 +134,43 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 			&q.TimeLimitMs, &q.MemoryLimitMb, &q.CreatedAt); err != nil {
 			continue
 		}
+		q.Tags = make([]string, 0)
 		questions = append(questions, q)
 	}
 
+	// Fetch tags for all problems in one query
+	if len(questions) > 0 {
+		ids := make([]int, len(questions))
+		idxMap := make(map[int]int) // problem_id -> index in questions
+		for i, q := range questions {
+			ids[i] = q.ID
+			idxMap[q.ID] = i
+		}
+
+		tagRows, err := h.DB.Query(context.Background(),
+			`SELECT pt.problem_id, t.name
+			 FROM app.problem_tags pt
+			 JOIN app.tags t ON t.id = pt.tag_id
+			 WHERE pt.problem_id = ANY($1)
+			 ORDER BY t.name`, ids)
+		if err == nil {
+			defer tagRows.Close()
+			for tagRows.Next() {
+				var pid int
+				var name string
+				if err := tagRows.Scan(&pid, &name); err == nil {
+					if idx, ok := idxMap[pid]; ok {
+						questions[idx].Tags = append(questions[idx].Tags, name)
+					}
+				}
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-"questions": questions,
-"total":     len(questions),
-})
+		"questions": questions,
+		"total":     len(questions),
+	})
 }
 
 func (h *Handler) GetQuestion(c *gin.Context) {
@@ -122,6 +197,22 @@ func (h *Handler) GetQuestion(c *gin.Context) {
 			var tc SampleTestCase
 			if err := rows.Scan(&tc.ID, &tc.Input, &tc.ExpectedOutput); err == nil {
 				q.SampleTests = append(q.SampleTests, tc)
+			}
+		}
+	}
+
+	// Fetch tags
+	q.Tags = make([]string, 0)
+	tagRows, err := h.DB.Query(context.Background(),
+		`SELECT t.name FROM app.problem_tags pt
+		 JOIN app.tags t ON t.id = pt.tag_id
+		 WHERE pt.problem_id = $1 ORDER BY t.name`, q.ID)
+	if err == nil {
+		defer tagRows.Close()
+		for tagRows.Next() {
+			var name string
+			if err := tagRows.Scan(&name); err == nil {
+				q.Tags = append(q.Tags, name)
 			}
 		}
 	}
@@ -177,6 +268,24 @@ func (h *Handler) CreateQuestion(c *gin.Context) {
 		)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create test case"})
+			return
+		}
+	}
+
+	// Insert tags
+	for _, tagName := range req.Tags {
+		tagName = strings.TrimSpace(tagName)
+		if tagName == "" {
+			continue
+		}
+		_, err := tx.Exec(context.Background(),
+			`INSERT INTO app.problem_tags (problem_id, tag_id)
+			 SELECT $1, t.id FROM app.tags t WHERE t.name = $2
+			 ON CONFLICT DO NOTHING`,
+			problemID, tagName,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to assign tag"})
 			return
 		}
 	}
@@ -248,6 +357,66 @@ func (h *Handler) RunSampleTests(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, result)
+}
+
+// UpdateQuestionTags replaces the tags on an existing problem.
+// PUT /questions/:slug/tags   body: {"tags": ["Array", "Two Pointers"]}
+func (h *Handler) UpdateQuestionTags(c *gin.Context) {
+	slug := c.Param("slug")
+
+	var req struct {
+		Tags []string `json:"tags" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Fetch problem ID
+	var problemID int
+	err := h.DB.QueryRow(context.Background(),
+		`SELECT id FROM app.problems WHERE slug = $1`, slug,
+	).Scan(&problemID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
+		return
+	}
+
+	tx, err := h.DB.Begin(context.Background())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		return
+	}
+	defer tx.Rollback(context.Background())
+
+	// Remove existing tags
+	_, _ = tx.Exec(context.Background(),
+		`DELETE FROM app.problem_tags WHERE problem_id = $1`, problemID)
+
+	// Insert new tags
+	for _, tagName := range req.Tags {
+		tagName = strings.TrimSpace(tagName)
+		if tagName == "" {
+			continue
+		}
+		_, err := tx.Exec(context.Background(),
+			`INSERT INTO app.problem_tags (problem_id, tag_id)
+			 SELECT $1, t.id FROM app.tags t WHERE t.name = $2
+			 ON CONFLICT DO NOTHING`,
+			problemID, tagName,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to assign tag"})
+			return
+		}
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Tags updated", "slug": slug, "tags": req.Tags})
 }
 
 func (h *Handler) ListTags(c *gin.Context) {

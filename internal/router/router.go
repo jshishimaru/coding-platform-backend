@@ -52,6 +52,7 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 			questions.GET("/health", h.QuestionsHealth)
 			questions.GET("/:slug", h.GetQuestion)
 			questions.POST("", authRequired, h.CreateQuestion)
+			questions.PUT("/:slug/tags", authRequired, h.UpdateQuestionTags)
 			questions.POST("/:slug/run", authRequired, h.RunSampleTests)
 		}
 
@@ -77,6 +78,7 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 		{
 			submissions.POST("", h.CreateSubmission)
 			submissions.GET("/health", h.SubmissionsHealth)
+			submissions.GET("/me", h.GetUserSubmissions)
 			submissions.GET("/question/:slug", h.GetQuestionSubmissions)
 			submissions.GET("/:id", h.GetSubmission)
 		}

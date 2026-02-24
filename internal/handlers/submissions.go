@@ -1,15 +1,15 @@
 package handlers
 
 import (
-"context"
-"encoding/json"
-"net/http"
-"strconv"
-"time"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"time"
 
-"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin"
 
-"github.com/coding-platform/backend/internal/sandbox"
+	"github.com/coding-platform/backend/internal/sandbox"
 )
 
 // ---------- Request / response types ----------
@@ -137,20 +137,20 @@ func (h *Handler) CreateSubmission(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-"submission": SubmissionResponse{
-ID:          submissionID,
-ProblemID:   problemID,
-ProblemSlug: req.ProblemSlug,
-Status:      result.Status,
-Language:    req.Language,
-RuntimeMs:   runtimeMs,
-MemoryKb:    memoryKb,
-PassedCount: result.PassedCount,
-TotalCount:  result.TotalCount,
-SubmittedAt: submittedAt,
-},
-"result": result,
-})
+		"submission": SubmissionResponse{
+			ID:          submissionID,
+			ProblemID:   problemID,
+			ProblemSlug: req.ProblemSlug,
+			Status:      result.Status,
+			Language:    req.Language,
+			RuntimeMs:   runtimeMs,
+			MemoryKb:    memoryKb,
+			PassedCount: result.PassedCount,
+			TotalCount:  result.TotalCount,
+			SubmittedAt: submittedAt,
+		},
+		"result": result,
+	})
 }
 
 func (h *Handler) GetSubmission(c *gin.Context) {
@@ -190,7 +190,42 @@ func (h *Handler) GetSubmission(c *gin.Context) {
 }
 
 func (h *Handler) GetUserSubmissions(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"submissions": []interface{}{}})
+	userID, _ := c.Get("userID")
+
+	// Return the best status per problem for this user.
+	// "accepted" beats any other status, which all count as "attempted".
+	rows, err := h.DB.Query(context.Background(),
+		`SELECT p.id, p.slug, p.title,
+		        CASE WHEN bool_or(s.status = 'accepted') THEN 'solved'
+		             ELSE 'attempted' END AS best_status
+		 FROM app.submissions s
+		 JOIN app.problems p ON p.id = s.problem_id
+		 WHERE s.user_id = $1
+		 GROUP BY p.id, p.slug, p.title
+		 ORDER BY p.id`, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+	defer rows.Close()
+
+	type ProblemStatus struct {
+		ProblemID int    `json:"problem_id"`
+		Slug      string `json:"slug"`
+		Title     string `json:"title"`
+		Status    string `json:"status"` // "solved" or "attempted"
+	}
+
+	statuses := make([]ProblemStatus, 0)
+	for rows.Next() {
+		var ps ProblemStatus
+		if err := rows.Scan(&ps.ProblemID, &ps.Slug, &ps.Title, &ps.Status); err != nil {
+			continue
+		}
+		statuses = append(statuses, ps)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"statuses": statuses})
 }
 
 func (h *Handler) GetQuestionSubmissions(c *gin.Context) {

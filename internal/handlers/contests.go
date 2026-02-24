@@ -58,14 +58,15 @@ type ContestDetail struct {
 }
 
 type ContestProblemDetail struct {
-	ProblemID     int    `json:"problem_id"`
-	Title         string `json:"title"`
-	Slug          string `json:"slug"`
-	Points        int    `json:"points"`
-	ProblemOrder  int    `json:"problem_order"`
-	Difficulty    string `json:"difficulty"`
-	TimeLimitMs   int    `json:"time_limit_ms"`
-	MemoryLimitMb int    `json:"memory_limit_mb"`
+	ProblemID     int      `json:"problem_id"`
+	Title         string   `json:"title"`
+	Slug          string   `json:"slug"`
+	Points        int      `json:"points"`
+	ProblemOrder  int      `json:"problem_order"`
+	Difficulty    string   `json:"difficulty"`
+	TimeLimitMs   int      `json:"time_limit_ms"`
+	MemoryLimitMb int      `json:"memory_limit_mb"`
+	Tags          []string `json:"tags"`
 }
 
 type LeaderboardEntry struct {
@@ -374,7 +375,37 @@ func (h *Handler) GetContest(c *gin.Context) {
 			var p ContestProblemDetail
 			if err := rows.Scan(&p.ProblemID, &p.Title, &p.Slug, &p.Points, &p.ProblemOrder,
 				&p.Difficulty, &p.TimeLimitMs, &p.MemoryLimitMb); err == nil {
+				p.Tags = make([]string, 0)
 				cd.Problems = append(cd.Problems, p)
+			}
+		}
+	}
+
+	// Fetch tags for contest problems — only if contest is NOT live
+	if cd.Status != "live" && len(cd.Problems) > 0 {
+		ids := make([]int, len(cd.Problems))
+		idxMap := make(map[int]int)
+		for i, p := range cd.Problems {
+			ids[i] = p.ProblemID
+			idxMap[p.ProblemID] = i
+		}
+
+		tagRows, err := h.DB.Query(context.Background(),
+			`SELECT pt.problem_id, t.name
+			 FROM app.problem_tags pt
+			 JOIN app.tags t ON t.id = pt.tag_id
+			 WHERE pt.problem_id = ANY($1)
+			 ORDER BY t.name`, ids)
+		if err == nil {
+			defer tagRows.Close()
+			for tagRows.Next() {
+				var pid int
+				var name string
+				if err := tagRows.Scan(&pid, &name); err == nil {
+					if idx, ok := idxMap[pid]; ok {
+						cd.Problems[idx].Tags = append(cd.Problems[idx].Tags, name)
+					}
+				}
 			}
 		}
 	}
