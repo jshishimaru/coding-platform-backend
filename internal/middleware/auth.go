@@ -57,6 +57,50 @@ func ValidateToken(tokenString string, cfg *config.Config) (*Claims, error) {
 	return claims, nil
 }
 
+// AuthOptional extracts user info from a Bearer token if present,
+// but does NOT reject unauthenticated requests. Handlers downstream
+// must treat an unset userID as an anonymous user.
+func AuthOptional(cfg *config.Config, rdb *redis.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			c.Next()
+			return
+		}
+
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			c.Next()
+			return
+		}
+
+		tokenString := parts[1]
+
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			blacklisted, err := rdb.Exists(ctx, "blacklist:"+tokenString).Result()
+			if err == nil && blacklisted > 0 {
+				c.Next()
+				return
+			}
+		}
+
+		claims, err := ValidateToken(tokenString, cfg)
+		if err != nil {
+			c.Next()
+			return
+		}
+
+		c.Set("userID", claims.UserID)
+		c.Set("username", claims.Username)
+		c.Set("role", claims.Role)
+		c.Set("token", tokenString)
+
+		c.Next()
+	}
+}
+
 // AuthRequired is a Gin middleware that enforces JWT authentication.
 func AuthRequired(cfg *config.Config, rdb *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {

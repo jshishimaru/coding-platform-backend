@@ -27,6 +27,7 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 
 	// Auth middleware shorthand
 	authRequired := middleware.AuthRequired(cfg, rdb)
+	authOptional := middleware.AuthOptional(cfg, rdb)
 
 	// API routes
 	api := r.Group("/api")
@@ -48,28 +49,38 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 		questions := api.Group("/questions")
 		{
 			questions.GET("", h.ListQuestions)
-			questions.GET("/tags/list", h.ListTags)
 			questions.GET("/health", h.QuestionsHealth)
-			questions.GET("/:slug", h.GetQuestion)
 			questions.POST("", authRequired, h.CreateQuestion)
-			questions.PUT("/:slug/tags", authRequired, h.UpdateQuestionTags)
-			questions.POST("/:slug/run", authRequired, h.RunSampleTests)
+		}
+
+		// Tags routes (separate from /questions/:slug to avoid Gin routing conflicts)
+		api.GET("/tags", h.ListTags)
+
+		// Question slug routes (no static sub-paths to avoid wildcard conflicts)
+		questionBySlug := api.Group("/questions/:slug")
+		{
+			questionBySlug.GET("", h.GetQuestion)
+			questionBySlug.PUT("/tags", authRequired, h.UpdateQuestionTags)
+			questionBySlug.POST("/run", authRequired, h.RunSampleTests)
 		}
 
 		// Contest routes
 		contests := api.Group("/contests")
 		{
-			contests.GET("", h.ListContests)
 			contests.GET("/health", h.ContestsHealth)
 			contests.GET("/ratings", h.GlobalRatings)
-			contests.GET("/:id", h.GetContest)
-			contests.GET("/:id/leaderboard", h.ContestLeaderboard)
+			contests.GET("/history", authRequired, h.UserContestHistory)
+			// Listing & detail: optional auth so we can filter by group membership
+			// when logged in, while still serving global contests to anonymous users.
+			contests.GET("", authOptional, h.ListContests)
+			contests.GET("/:id", authOptional, h.GetContest)
+			contests.GET("/:id/leaderboard", authOptional, h.ContestLeaderboard)
 			contests.GET("/:id/ratings/predict", h.ContestRatingPredict)
 			contests.GET("/:id/ratings/stream", h.ContestRatingStream)
 			contests.POST("", authRequired, h.CreateContest)
 			contests.POST("/:id/submit", authRequired, h.ContestSubmit)
 			contests.POST("/:id/finalize", authRequired, h.FinalizeContest)
-			contests.GET("/history", authRequired, h.UserContestHistory)
+			contests.POST("/:id/proctor-events", authRequired, h.RecordProctorEvent)
 		}
 
 		// Submission routes (all protected)
@@ -79,8 +90,22 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 			submissions.POST("", h.CreateSubmission)
 			submissions.GET("/health", h.SubmissionsHealth)
 			submissions.GET("/me", h.GetUserSubmissions)
+			submissions.GET("/mine", h.ListMySubmissions) // full filtered history
 			submissions.GET("/question/:slug", h.GetQuestionSubmissions)
 			submissions.GET("/:id", h.GetSubmission)
+		}
+
+		// Groups — all members can list/search; joining requires auth
+		groups := api.Group("/groups")
+		groups.Use(authRequired)
+		{
+			groups.GET("", h.ListGroups)
+			// Static routes MUST be declared before parameterised ones.
+			groups.GET("/my-requests", h.ListMyJoinRequests)
+			groups.GET("/:id", h.GetGroup)
+			groups.POST("/:id/join", h.RequestJoinGroup)
+			groups.DELETE("/:id/join", h.CancelJoinRequest)
+			groups.POST("/:id/leave", h.LeaveGroup)
 		}
 
 		// Sandbox routes (protected)
@@ -95,6 +120,9 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 		admin := api.Group("/admin")
 		admin.Use(authRequired)
 		{
+			// ── Dashboard ─────────────────────────────────────────────
+			admin.GET("/dashboard", middleware.RequireSetterOrAbove(), h.AdminDashboard)
+
 			// ── Problem management ────────────────────────────────────
 			adminProblems := admin.Group("/problems")
 			adminProblems.Use(middleware.RequireSetterOrAbove())
@@ -189,6 +217,23 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 				adminContests.DELETE("/:id/problems/:cpId", h.AdminRemoveContestProblem)
 				adminContests.POST("/:id/publish", h.AdminPublishContest)
 				adminContests.POST("/:id/finalize", middleware.RequireAdmin(), h.AdminFinalizeContestAdmin)
+
+				// Proctoring (contest-scoped)
+				adminContests.GET("/:id/proctor-events", h.AdminListProctorEvents)
+				adminContests.GET("/:id/proctor-summary", h.AdminProctorSummary)
+
+				// Export
+				adminContests.GET("/:id/export.csv", h.AdminExportContestCSV)
+			}
+
+			// ── Submission management (admin grading) ─────────────────
+			adminSubmissions := admin.Group("/submissions")
+			adminSubmissions.Use(middleware.RequireSetterOrAbove())
+			{
+				adminSubmissions.GET("", h.AdminListSubmissions)
+				adminSubmissions.GET("/:id", h.AdminGetSubmission)
+				adminSubmissions.PUT("/:id/grade", h.AdminGradeSubmission)
+				adminSubmissions.POST("/:id/run", h.AdminRunSubmission)
 			}
 
 			// ── User management (admin only) ──────────────────────────
@@ -198,6 +243,21 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 				adminUsers.GET("", h.AdminListUsers)
 				adminUsers.GET("/:id", h.AdminGetUser)
 				adminUsers.PUT("/:id/role", h.AdminUpdateUserRole)
+			}
+
+			// ── Group management ─────────────────────────────────────
+			// Creating/deleting groups is admin-only; group admins can
+			// update and manage members inside a group.
+			adminGroups := admin.Group("/groups")
+			{
+				adminGroups.POST("", middleware.RequireAdmin(), h.AdminCreateGroup)
+				adminGroups.DELETE("/:id", middleware.RequireAdmin(), h.AdminDeleteGroup)
+				adminGroups.PUT("/:id", h.AdminUpdateGroup)
+				adminGroups.GET("/:id/requests", h.AdminListJoinRequests)
+				adminGroups.POST("/:id/requests/:reqId/decide", h.AdminDecideJoinRequest)
+				adminGroups.POST("/:id/members", h.AdminAddGroupMember)
+				adminGroups.PUT("/:id/members/:userId", h.AdminUpdateGroupMember)
+				adminGroups.DELETE("/:id/members/:userId", h.AdminRemoveGroupMember)
 			}
 
 			// ── Audit log (admin only) ────────────────────────────────

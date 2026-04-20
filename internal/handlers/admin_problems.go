@@ -23,6 +23,7 @@ type AdminCreateProblemRequest struct {
 	MemoryLimitMb int    `json:"memory_limit_mb"`
 	CheckerCode   string `json:"checker_code"`
 	Points        *int   `json:"points"`
+	ProblemType   string `json:"problem_type"`
 	Tags          []int  `json:"tags"`
 }
 
@@ -34,6 +35,7 @@ type AdminUpdateProblemRequest struct {
 	MemoryLimitMb *int    `json:"memory_limit_mb"`
 	CheckerCode   *string `json:"checker_code"`
 	Points        *int    `json:"points"`
+	ProblemType   *string `json:"problem_type"`
 	Tags          *[]int  `json:"tags"`
 }
 
@@ -45,6 +47,7 @@ type AdminProblemSummary struct {
 	TimeLimitMs   int       `json:"time_limit_ms"`
 	MemoryLimitMb int       `json:"memory_limit_mb"`
 	Points        *int      `json:"points"`
+	ProblemType   string    `json:"problem_type"`
 	CreatedBy     int       `json:"created_by"`
 	CreatorName   string    `json:"creator_name"`
 	TestCount     int       `json:"test_count"`
@@ -61,6 +64,7 @@ type AdminProblemDetail struct {
 	MemoryLimitMb int       `json:"memory_limit_mb"`
 	CheckerCode   string    `json:"checker_code"`
 	Points        *int      `json:"points"`
+	ProblemType   string    `json:"problem_type"`
 	CreatedBy     int       `json:"created_by"`
 	CreatorName   string    `json:"creator_name"`
 	ContestID     *int      `json:"contest_id"`
@@ -138,7 +142,7 @@ func (h *Handler) AdminListProblems(c *gin.Context) {
 
 	// Build query dynamically
 	query := `SELECT p.id, p.title, p.slug, p.difficulty, p.time_limit_ms, p.memory_limit_mb,
-	                  p.points, p.created_by, u.username,
+	                  p.points, p.problem_type, p.created_by, u.username,
 	                  (SELECT COUNT(*) FROM app.test_cases WHERE problem_id = p.id),
 	                  p.created_at
 	           FROM app.problems p
@@ -203,7 +207,7 @@ func (h *Handler) AdminListProblems(c *gin.Context) {
 	for rows.Next() {
 		var p AdminProblemSummary
 		if err := rows.Scan(&p.ID, &p.Title, &p.Slug, &p.Difficulty,
-			&p.TimeLimitMs, &p.MemoryLimitMb, &p.Points, &p.CreatedBy,
+			&p.TimeLimitMs, &p.MemoryLimitMb, &p.Points, &p.ProblemType, &p.CreatedBy,
 			&p.CreatorName, &p.TestCount, &p.CreatedAt); err != nil {
 			continue
 		}
@@ -211,10 +215,10 @@ func (h *Handler) AdminListProblems(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"problems": problems,
-		"total":    total,
-		"page":     page,
-		"pages":    (total + limit - 1) / limit,
+		"data":  problems,
+		"total": total,
+		"page":  page,
+		"pages": (total + limit - 1) / limit,
 	})
 }
 
@@ -235,6 +239,13 @@ func (h *Handler) AdminCreateProblem(c *gin.Context) {
 	if req.Difficulty == "" {
 		req.Difficulty = "medium"
 	}
+	if req.ProblemType == "" {
+		req.ProblemType = "standard"
+	}
+	if req.ProblemType != "standard" && req.ProblemType != "subjective" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "problem_type must be 'standard' or 'subjective'"})
+		return
+	}
 	req.Slug = strings.ToLower(strings.ReplaceAll(req.Slug, " ", "-"))
 
 	userID, _ := c.Get("userID")
@@ -251,10 +262,10 @@ func (h *Handler) AdminCreateProblem(c *gin.Context) {
 	// Insert problem
 	var problemID int
 	err = tx.QueryRow(ctx,
-		`INSERT INTO app.problems (title, slug, statement, difficulty, time_limit_ms, memory_limit_mb, checker_code, created_by, points)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+		`INSERT INTO app.problems (title, slug, statement, difficulty, time_limit_ms, memory_limit_mb, checker_code, created_by, points, problem_type)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
 		req.Title, req.Slug, req.Statement, req.Difficulty,
-		req.TimeLimitMs, req.MemoryLimitMb, req.CheckerCode, uid, req.Points,
+		req.TimeLimitMs, req.MemoryLimitMb, req.CheckerCode, uid, req.Points, req.ProblemType,
 	).Scan(&problemID)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate key") {
@@ -316,12 +327,12 @@ func (h *Handler) AdminGetProblem(c *gin.Context) {
 	var p AdminProblemDetail
 	err = h.DB.QueryRow(ctx,
 		`SELECT p.id, p.title, p.slug, p.statement, p.difficulty, p.time_limit_ms, p.memory_limit_mb,
-		        p.checker_code, p.points, p.created_by, u.username, p.contest_id, p.created_at
+		        p.checker_code, p.points, p.problem_type, p.created_by, u.username, p.contest_id, p.created_at
 		 FROM app.problems p
 		 JOIN app.users u ON u.id = p.created_by
 		 WHERE p.id = $1`, problemID,
 	).Scan(&p.ID, &p.Title, &p.Slug, &p.Statement, &p.Difficulty,
-		&p.TimeLimitMs, &p.MemoryLimitMb, &p.CheckerCode, &p.Points,
+		&p.TimeLimitMs, &p.MemoryLimitMb, &p.CheckerCode, &p.Points, &p.ProblemType,
 		&p.CreatedBy, &p.CreatorName, &p.ContestID, &p.CreatedAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Problem not found"})
@@ -373,13 +384,13 @@ func (h *Handler) AdminUpdateProblem(c *gin.Context) {
 	defer tx.Rollback(ctx)
 
 	// Fetch current problem state
-	var title, statement, difficulty, checkerCode string
+	var title, statement, difficulty, checkerCode, problemType string
 	var timeLimitMs, memoryLimitMb int
 	var points *int
 	err = tx.QueryRow(ctx,
-		`SELECT title, statement, difficulty, time_limit_ms, memory_limit_mb, checker_code, points
+		`SELECT title, statement, difficulty, time_limit_ms, memory_limit_mb, checker_code, points, problem_type
 		 FROM app.problems WHERE id = $1`, problemID,
-	).Scan(&title, &statement, &difficulty, &timeLimitMs, &memoryLimitMb, &checkerCode, &points)
+	).Scan(&title, &statement, &difficulty, &timeLimitMs, &memoryLimitMb, &checkerCode, &points, &problemType)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Problem not found"})
 		return
@@ -407,13 +418,20 @@ func (h *Handler) AdminUpdateProblem(c *gin.Context) {
 	if req.Points != nil {
 		points = req.Points
 	}
+	if req.ProblemType != nil {
+		if *req.ProblemType != "standard" && *req.ProblemType != "subjective" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "problem_type must be 'standard' or 'subjective'"})
+			return
+		}
+		problemType = *req.ProblemType
+	}
 
 	// Update the problem row
 	_, err = tx.Exec(ctx,
 		`UPDATE app.problems SET title=$1, statement=$2, difficulty=$3, time_limit_ms=$4,
-		        memory_limit_mb=$5, checker_code=$6, points=$7
-		 WHERE id=$8`,
-		title, statement, difficulty, timeLimitMs, memoryLimitMb, checkerCode, points, problemID,
+		        memory_limit_mb=$5, checker_code=$6, points=$7, problem_type=$8
+		 WHERE id=$9`,
+		title, statement, difficulty, timeLimitMs, memoryLimitMb, checkerCode, points, problemType, problemID,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update problem"})

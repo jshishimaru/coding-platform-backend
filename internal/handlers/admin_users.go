@@ -9,6 +9,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// AdminDashboard returns high-level platform stats for the admin dashboard.
+func (h *Handler) AdminDashboard(c *gin.Context) {
+	ctx := context.Background()
+
+	var problemsCount, contestsCount, usersCount, recentSubmissions int
+
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.problems`).Scan(&problemsCount)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.contests`).Scan(&contestsCount)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.users`).Scan(&usersCount)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.submissions WHERE submitted_at >= NOW() - INTERVAL '24 hours'`).Scan(&recentSubmissions)
+
+	c.JSON(http.StatusOK, gin.H{
+		"problems_count":     problemsCount,
+		"contests_count":     contestsCount,
+		"users_count":        usersCount,
+		"recent_submissions": recentSubmissions,
+	})
+}
+
 // ──────────────────────────────────────────────────────────
 // Request / Response Types
 // ──────────────────────────────────────────────────────────
@@ -115,7 +134,7 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"users": users,
+		"data":  users,
 		"total": total,
 		"page":  page,
 		"pages": (total + limit - 1) / limit,
@@ -271,9 +290,9 @@ func (h *Handler) AdminGetAuditLog(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"entries": entries,
-		"total":   total,
-		"page":    page,
-		"pages":   (total + limit - 1) / limit,
+		"data":  entries,
+		"total": total,
+		"page":  page,
+		"pages": (total + limit - 1) / limit,
 	})
 }

@@ -14,6 +14,7 @@ type Problem struct {
 	CreatedBy     int       `json:"created_by"`
 	ContestID     *int      `json:"contest_id,omitempty"`
 	Points        *int      `json:"points,omitempty"`
+	ProblemType   string    `json:"problem_type"` // 'standard' or 'subjective'
 	CreatedAt     time.Time `json:"created_at"`
 	// Populated via joins
 	Tags []string `json:"tags,omitempty"`

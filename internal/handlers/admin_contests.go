@@ -23,6 +23,9 @@ type AdminCreateContestRequest struct {
 	PenaltyTimeSeconds int       `json:"penalty_time_seconds"`
 	FreezeTimeMinutes  *int      `json:"freeze_time_minutes"`
 	AllowVirtual       bool      `json:"allow_virtual"`
+	GroupID            *int      `json:"group_id"`
+	Proctored          bool      `json:"proctored"`
+	GradeVisibility    string    `json:"grade_visibility"`
 }
 
 type AdminUpdateContestRequest struct {
@@ -35,6 +38,10 @@ type AdminUpdateContestRequest struct {
 	PenaltyTimeSeconds *int       `json:"penalty_time_seconds"`
 	FreezeTimeMinutes  *int       `json:"freeze_time_minutes"`
 	AllowVirtual       *bool      `json:"allow_virtual"`
+	GroupID            *int       `json:"group_id"`
+	ClearGroup         *bool      `json:"clear_group"`
+	Proctored          *bool      `json:"proctored"`
+	GradeVisibility    *string    `json:"grade_visibility"`
 }
 
 type AdminContestSummary struct {
@@ -50,6 +57,10 @@ type AdminContestSummary struct {
 	CreatedBy        int       `json:"created_by"`
 	CreatorName      string    `json:"creator_name"`
 	CreatedAt        time.Time `json:"created_at"`
+	GroupID          *int      `json:"group_id"`
+	GroupName        string    `json:"group_name"`
+	Proctored        bool      `json:"proctored"`
+	GradeVisibility  string    `json:"grade_visibility"`
 }
 
 type AdminContestDetail struct {
@@ -67,6 +78,10 @@ type AdminContestDetail struct {
 	CreatedBy          int                   `json:"created_by"`
 	CreatorName        string                `json:"creator_name"`
 	CreatedAt          time.Time             `json:"created_at"`
+	GroupID            *int                  `json:"group_id"`
+	GroupName          string                `json:"group_name"`
+	Proctored          bool                  `json:"proctored"`
+	GradeVisibility    string                `json:"grade_visibility"`
 	Problems           []AdminContestProblem `json:"problems"`
 }
 
@@ -75,9 +90,11 @@ type AdminContestProblem struct {
 	ProblemID     int    `json:"problem_id"`
 	Title         string `json:"title"`
 	Slug          string `json:"slug"`
+	ProblemType   string `json:"problem_type"`
 	MaxPoints     int    `json:"max_points"`
 	ProblemOrder  int    `json:"problem_order"`
 	ScoringConfig string `json:"scoring_config"`
+	ScoringMode   string `json:"scoring_mode"`
 }
 
 type AddContestProblemRequest struct {
@@ -85,12 +102,14 @@ type AddContestProblemRequest struct {
 	MaxPoints     int    `json:"max_points"`
 	ProblemOrder  int    `json:"problem_order"`
 	ScoringConfig string `json:"scoring_config"`
+	ScoringMode   string `json:"scoring_mode"`
 }
 
 type UpdateContestProblemRequest struct {
 	MaxPoints     *int    `json:"max_points"`
 	ProblemOrder  *int    `json:"problem_order"`
 	ScoringConfig *string `json:"scoring_config"`
+	ScoringMode   *string `json:"scoring_mode"`
 }
 
 // ──────────────────────────────────────────────────────────
@@ -112,9 +131,11 @@ func (h *Handler) AdminListContests(c *gin.Context) {
 	query := `SELECT c.id, c.title, c.start_time, c.end_time, c.is_rated, c.scoring_type,
 	                  c.status, c.created_by, u.username, c.created_at,
 	                  (SELECT COUNT(*) FROM app.contest_problems WHERE contest_id = c.id),
-	                  (SELECT COUNT(*) FROM app.contest_participants WHERE contest_id = c.id)
+	                  (SELECT COUNT(*) FROM app.contest_participants WHERE contest_id = c.id),
+	                  c.group_id, COALESCE(g.name, ''), c.proctored, c.grade_visibility
 	           FROM app.contests c
 	           JOIN app.users u ON u.id = c.created_by
+	           LEFT JOIN app.groups g ON g.id = c.group_id
 	           WHERE 1=1`
 	countQuery := `SELECT COUNT(*) FROM app.contests c WHERE 1=1`
 	args := []interface{}{}
@@ -148,17 +169,18 @@ func (h *Handler) AdminListContests(c *gin.Context) {
 		var cs AdminContestSummary
 		if err := rows.Scan(&cs.ID, &cs.Title, &cs.StartTime, &cs.EndTime,
 			&cs.IsRated, &cs.ScoringType, &cs.Status, &cs.CreatedBy,
-			&cs.CreatorName, &cs.CreatedAt, &cs.ProblemCount, &cs.ParticipantCount); err != nil {
+			&cs.CreatorName, &cs.CreatedAt, &cs.ProblemCount, &cs.ParticipantCount,
+			&cs.GroupID, &cs.GroupName, &cs.Proctored, &cs.GradeVisibility); err != nil {
 			continue
 		}
 		contests = append(contests, cs)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"contests": contests,
-		"total":    total,
-		"page":     page,
-		"pages":    (total + limit - 1) / limit,
+		"data":  contests,
+		"total": total,
+		"page":  page,
+		"pages": (total + limit - 1) / limit,
 	})
 }
 
@@ -189,13 +211,28 @@ func (h *Handler) AdminCreateContest(c *gin.Context) {
 	uid := userID.(int)
 	ctx := context.Background()
 
+	// Group contests are always unrated
+	if req.GroupID != nil {
+		req.IsRated = false
+	}
+	if req.GradeVisibility == "" {
+		req.GradeVisibility = "private"
+	}
+	if req.GradeVisibility != "private" && req.GradeVisibility != "group" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "grade_visibility must be 'private' or 'group'"})
+		return
+	}
+
 	var contestID int
 	err := h.DB.QueryRow(ctx,
-		`INSERT INTO app.contests (title, description, start_time, end_time, is_rated, scoring_type, status, penalty_time_seconds, freeze_time_minutes, allow_virtual, created_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10) RETURNING id`,
+		`INSERT INTO app.contests (title, description, start_time, end_time, is_rated, scoring_type,
+		                           status, penalty_time_seconds, freeze_time_minutes, allow_virtual,
+		                           created_by, group_id, proctored, grade_visibility)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
 		req.Title, req.Description, req.StartTime, req.EndTime,
 		req.IsRated, req.ScoringType, req.PenaltyTimeSeconds,
 		req.FreezeTimeMinutes, req.AllowVirtual, uid,
+		req.GroupID, req.Proctored, req.GradeVisibility,
 	).Scan(&contestID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create contest"})
@@ -204,6 +241,7 @@ func (h *Handler) AdminCreateContest(c *gin.Context) {
 
 	h.logAudit(uid, "contest.create", "contest", contestID, map[string]interface{}{
 		"title": req.Title, "scoring_type": req.ScoringType,
+		"group_id": req.GroupID, "proctored": req.Proctored,
 	}, c.ClientIP())
 
 	c.JSON(http.StatusCreated, gin.H{"id": contestID})
@@ -222,13 +260,16 @@ func (h *Handler) AdminGetContest(c *gin.Context) {
 	err = h.DB.QueryRow(ctx,
 		`SELECT c.id, c.title, c.description, c.start_time, c.end_time,
 		        c.is_rated, c.scoring_type, c.status, c.penalty_time_seconds,
-		        c.freeze_time_minutes, c.allow_virtual, c.created_by, u.username, c.created_at
+		        c.freeze_time_minutes, c.allow_virtual, c.created_by, u.username, c.created_at,
+		        c.group_id, COALESCE(g.name, ''), c.proctored, c.grade_visibility
 		 FROM app.contests c
 		 JOIN app.users u ON u.id = c.created_by
+		 LEFT JOIN app.groups g ON g.id = c.group_id
 		 WHERE c.id = $1`, contestID,
 	).Scan(&cd.ID, &cd.Title, &cd.Description, &cd.StartTime, &cd.EndTime,
 		&cd.IsRated, &cd.ScoringType, &cd.Status, &cd.PenaltyTimeSeconds,
-		&cd.FreezeTimeMinutes, &cd.AllowVirtual, &cd.CreatedBy, &cd.CreatorName, &cd.CreatedAt)
+		&cd.FreezeTimeMinutes, &cd.AllowVirtual, &cd.CreatedBy, &cd.CreatorName, &cd.CreatedAt,
+		&cd.GroupID, &cd.GroupName, &cd.Proctored, &cd.GradeVisibility)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
@@ -237,7 +278,8 @@ func (h *Handler) AdminGetContest(c *gin.Context) {
 	// Fetch contest problems
 	cd.Problems = make([]AdminContestProblem, 0)
 	rows, err := h.DB.Query(ctx,
-		`SELECT cp.id, cp.problem_id, p.title, p.slug, cp.max_points, cp.problem_order, cp.scoring_config::text
+		`SELECT cp.id, cp.problem_id, p.title, p.slug, p.problem_type,
+		        cp.max_points, cp.problem_order, cp.scoring_config::text, cp.scoring_mode
 		 FROM app.contest_problems cp
 		 JOIN app.problems p ON p.id = cp.problem_id
 		 WHERE cp.contest_id = $1
@@ -246,8 +288,8 @@ func (h *Handler) AdminGetContest(c *gin.Context) {
 		defer rows.Close()
 		for rows.Next() {
 			var p AdminContestProblem
-			if err := rows.Scan(&p.ID, &p.ProblemID, &p.Title, &p.Slug,
-				&p.MaxPoints, &p.ProblemOrder, &p.ScoringConfig); err == nil {
+			if err := rows.Scan(&p.ID, &p.ProblemID, &p.Title, &p.Slug, &p.ProblemType,
+				&p.MaxPoints, &p.ProblemOrder, &p.ScoringConfig, &p.ScoringMode); err == nil {
 				cd.Problems = append(cd.Problems, p)
 			}
 		}
@@ -333,6 +375,29 @@ func (h *Handler) AdminUpdateContest(c *gin.Context) {
 		updates = append(updates, "allow_virtual = $"+strconv.Itoa(argIdx))
 		args = append(args, *req.AllowVirtual)
 		argIdx++
+	}
+	if req.Proctored != nil {
+		updates = append(updates, "proctored = $"+strconv.Itoa(argIdx))
+		args = append(args, *req.Proctored)
+		argIdx++
+	}
+	if req.GradeVisibility != nil {
+		if *req.GradeVisibility != "private" && *req.GradeVisibility != "group" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "grade_visibility must be 'private' or 'group'"})
+			return
+		}
+		updates = append(updates, "grade_visibility = $"+strconv.Itoa(argIdx))
+		args = append(args, *req.GradeVisibility)
+		argIdx++
+	}
+	if req.ClearGroup != nil && *req.ClearGroup {
+		updates = append(updates, "group_id = NULL")
+	} else if req.GroupID != nil {
+		updates = append(updates, "group_id = $"+strconv.Itoa(argIdx))
+		args = append(args, *req.GroupID)
+		argIdx++
+		// Group contests are always unrated
+		updates = append(updates, "is_rated = FALSE")
 	}
 
 	if len(updates) == 0 {
@@ -427,12 +492,22 @@ func (h *Handler) AdminAddContestProblem(c *gin.Context) {
 	if scoringConfig == "" {
 		scoringConfig = "{}"
 	}
+	scoringMode := req.ScoringMode
+	if scoringMode == "" {
+		scoringMode = "all_or_nothing"
+	}
+	if scoringMode != "all_or_nothing" && scoringMode != "partial" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scoring_mode must be 'all_or_nothing' or 'partial'"})
+		return
+	}
 
 	var cpID int
 	err = h.DB.QueryRow(ctx,
-		`INSERT INTO app.contest_problems (contest_id, problem_id, points, problem_order, max_points, scoring_config)
-		 VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id`,
-		contestID, req.ProblemID, req.MaxPoints, req.ProblemOrder, req.MaxPoints, scoringConfig,
+		`INSERT INTO app.contest_problems (contest_id, problem_id, points, problem_order,
+		                                   max_points, scoring_config, scoring_mode)
+		 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7) RETURNING id`,
+		contestID, req.ProblemID, req.MaxPoints, req.ProblemOrder,
+		req.MaxPoints, scoringConfig, scoringMode,
 	).Scan(&cpID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add problem to contest"})
@@ -486,6 +561,15 @@ func (h *Handler) AdminUpdateContestProblem(c *gin.Context) {
 	if req.ScoringConfig != nil {
 		updates = append(updates, "scoring_config = $"+strconv.Itoa(argIdx)+"::jsonb")
 		args = append(args, *req.ScoringConfig)
+		argIdx++
+	}
+	if req.ScoringMode != nil {
+		if *req.ScoringMode != "all_or_nothing" && *req.ScoringMode != "partial" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "scoring_mode must be 'all_or_nothing' or 'partial'"})
+			return
+		}
+		updates = append(updates, "scoring_mode = $"+strconv.Itoa(argIdx))
+		args = append(args, *req.ScoringMode)
 		argIdx++
 	}
 

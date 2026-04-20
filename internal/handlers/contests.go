@@ -20,41 +20,53 @@ import (
 // ──────────────────────────────────────────────────────────────
 
 type CreateContestRequest struct {
-	Title       string                  `json:"title" binding:"required"`
-	Description string                  `json:"description"`
-	StartTime   string                  `json:"start_time" binding:"required"`
-	EndTime     string                  `json:"end_time" binding:"required"`
-	IsRated     bool                    `json:"is_rated"`
-	Problems    []ContestProblemRequest `json:"problems" binding:"required"`
+	Title           string                  `json:"title" binding:"required"`
+	Description     string                  `json:"description"`
+	StartTime       string                  `json:"start_time" binding:"required"`
+	EndTime         string                  `json:"end_time" binding:"required"`
+	IsRated         bool                    `json:"is_rated"`
+	GroupID         *int                    `json:"group_id"`
+	Proctored       bool                    `json:"proctored"`
+	GradeVisibility string                  `json:"grade_visibility"`
+	Problems        []ContestProblemRequest `json:"problems" binding:"required"`
 }
 
 type ContestProblemRequest struct {
-	ProblemID    int `json:"problem_id" binding:"required"`
-	Points       int `json:"points"`
-	ProblemOrder int `json:"problem_order"`
+	ProblemID    int    `json:"problem_id" binding:"required"`
+	Points       int    `json:"points"`
+	ProblemOrder int    `json:"problem_order"`
+	ScoringMode  string `json:"scoring_mode"` // "all_or_nothing" or "partial"
 }
 
 type ContestSummary struct {
-	ID           int       `json:"id"`
-	Title        string    `json:"title"`
-	Description  string    `json:"description"`
-	StartTime    time.Time `json:"start_time"`
-	EndTime      time.Time `json:"end_time"`
-	IsRated      bool      `json:"is_rated"`
-	Status       string    `json:"status"`
-	Participants int       `json:"participants"`
-	ProblemCount int       `json:"problem_count"`
+	ID              int       `json:"id"`
+	Title           string    `json:"title"`
+	Description     string    `json:"description"`
+	StartTime       time.Time `json:"start_time"`
+	EndTime         time.Time `json:"end_time"`
+	IsRated         bool      `json:"is_rated"`
+	Status          string    `json:"status"`
+	Participants    int       `json:"participants"`
+	ProblemCount    int       `json:"problem_count"`
+	GroupID         *int      `json:"group_id,omitempty"`
+	GroupName       string    `json:"group_name,omitempty"`
+	Proctored       bool      `json:"proctored"`
+	GradeVisibility string    `json:"grade_visibility"`
 }
 
 type ContestDetail struct {
-	ID          int                    `json:"id"`
-	Title       string                 `json:"title"`
-	Description string                 `json:"description"`
-	StartTime   time.Time              `json:"start_time"`
-	EndTime     time.Time              `json:"end_time"`
-	IsRated     bool                   `json:"is_rated"`
-	Status      string                 `json:"status"`
-	Problems    []ContestProblemDetail `json:"problems"`
+	ID              int                    `json:"id"`
+	Title           string                 `json:"title"`
+	Description     string                 `json:"description"`
+	StartTime       time.Time              `json:"start_time"`
+	EndTime         time.Time              `json:"end_time"`
+	IsRated         bool                   `json:"is_rated"`
+	Status          string                 `json:"status"`
+	Problems        []ContestProblemDetail `json:"problems"`
+	GroupID         *int                   `json:"group_id,omitempty"`
+	GroupName       string                 `json:"group_name,omitempty"`
+	Proctored       bool                   `json:"proctored"`
+	GradeVisibility string                 `json:"grade_visibility"`
 }
 
 type ContestProblemDetail struct {
@@ -66,6 +78,8 @@ type ContestProblemDetail struct {
 	Difficulty    string   `json:"difficulty"`
 	TimeLimitMs   int      `json:"time_limit_ms"`
 	MemoryLimitMb int      `json:"memory_limit_mb"`
+	ProblemType   string   `json:"problem_type"`
+	ScoringMode   string   `json:"scoring_mode"`
 	Tags          []string `json:"tags"`
 }
 
@@ -311,12 +325,36 @@ func (h *Handler) ContestsHealth(c *gin.Context) {
 // ──────────────────────────────────────────────────────────────
 
 func (h *Handler) ListContests(c *gin.Context) {
-	rows, err := h.DB.Query(context.Background(),
-		`SELECT c.id, c.title, c.description, c.start_time, c.end_time, c.is_rated,
-        (SELECT COUNT(*) FROM app.contest_participants WHERE contest_id = c.id) AS participants,
-        (SELECT COUNT(*) FROM app.contest_problems WHERE contest_id = c.id) AS problem_count
- FROM app.contests c
- ORDER BY c.start_time DESC`)
+	userID, _ := c.Get("userID")
+	uid, _ := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	// Site admins see everything, everyone else only sees:
+	//   - global contests (group_id IS NULL), OR
+	//   - group contests where they are a member
+	query := `
+		SELECT c.id, c.title, c.description, c.start_time, c.end_time, c.is_rated,
+		       c.group_id, COALESCE(g.name, ''),
+		       c.proctored, c.grade_visibility,
+		       (SELECT COUNT(*) FROM app.contest_participants WHERE contest_id = c.id),
+		       (SELECT COUNT(*) FROM app.contest_problems   WHERE contest_id = c.id)
+		FROM app.contests c
+		LEFT JOIN app.groups g ON g.id = c.group_id`
+
+	args := []interface{}{}
+	if roleStr != "admin" {
+		query += `
+		WHERE c.group_id IS NULL
+		   OR EXISTS (
+		       SELECT 1 FROM app.group_members gm
+		       WHERE gm.group_id = c.group_id AND gm.user_id = $1
+		   )`
+		args = append(args, uid)
+	}
+	query += ` ORDER BY c.start_time DESC`
+
+	rows, err := h.DB.Query(context.Background(), query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
@@ -327,7 +365,8 @@ func (h *Handler) ListContests(c *gin.Context) {
 	for rows.Next() {
 		var cs ContestSummary
 		if err := rows.Scan(&cs.ID, &cs.Title, &cs.Description, &cs.StartTime, &cs.EndTime,
-			&cs.IsRated, &cs.Participants, &cs.ProblemCount); err != nil {
+			&cs.IsRated, &cs.GroupID, &cs.GroupName, &cs.Proctored, &cs.GradeVisibility,
+			&cs.Participants, &cs.ProblemCount); err != nil {
 			continue
 		}
 		cs.Status = contestStatus(cs.StartTime, cs.EndTime)
@@ -349,32 +388,51 @@ func (h *Handler) GetContest(c *gin.Context) {
 		return
 	}
 
+	userID, _ := c.Get("userID")
+	uid, _ := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
 	var cd ContestDetail
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT id, title, description, start_time, end_time, is_rated
- FROM app.contests WHERE id = $1`, contestID,
-	).Scan(&cd.ID, &cd.Title, &cd.Description, &cd.StartTime, &cd.EndTime, &cd.IsRated)
+		`SELECT c.id, c.title, c.description, c.start_time, c.end_time, c.is_rated,
+		        c.group_id, COALESCE(g.name, ''), c.proctored, c.grade_visibility
+		 FROM app.contests c
+		 LEFT JOIN app.groups g ON g.id = c.group_id
+		 WHERE c.id = $1`, contestID,
+	).Scan(&cd.ID, &cd.Title, &cd.Description, &cd.StartTime, &cd.EndTime, &cd.IsRated,
+		&cd.GroupID, &cd.GroupName, &cd.Proctored, &cd.GradeVisibility)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
 	}
 	cd.Status = contestStatus(cd.StartTime, cd.EndTime)
 
+	// Enforce group membership for group contests
+	if cd.GroupID != nil && roleStr != "admin" {
+		if !h.isGroupMember(context.Background(), *cd.GroupID, uid, roleStr) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "This contest is restricted to group members"})
+			return
+		}
+	}
+
 	// Fetch problems
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT cp.problem_id, p.title, p.slug, cp.points, cp.problem_order,
-        p.difficulty, p.time_limit_ms, p.memory_limit_mb
- FROM app.contest_problems cp
- JOIN app.problems p ON p.id = cp.problem_id
- WHERE cp.contest_id = $1
- ORDER BY cp.problem_order`, contestID)
+		        p.difficulty, p.time_limit_ms, p.memory_limit_mb,
+		        p.problem_type, cp.scoring_mode
+		 FROM app.contest_problems cp
+		 JOIN app.problems p ON p.id = cp.problem_id
+		 WHERE cp.contest_id = $1
+		 ORDER BY cp.problem_order`, contestID)
 	if err == nil {
 		defer rows.Close()
 		cd.Problems = make([]ContestProblemDetail, 0)
 		for rows.Next() {
 			var p ContestProblemDetail
 			if err := rows.Scan(&p.ProblemID, &p.Title, &p.Slug, &p.Points, &p.ProblemOrder,
-				&p.Difficulty, &p.TimeLimitMs, &p.MemoryLimitMb); err == nil {
+				&p.Difficulty, &p.TimeLimitMs, &p.MemoryLimitMb,
+				&p.ProblemType, &p.ScoringMode); err == nil {
 				p.Tags = make([]string, 0)
 				cd.Problems = append(cd.Problems, p)
 			}
@@ -437,6 +495,20 @@ func (h *Handler) CreateContest(c *gin.Context) {
 
 	userID, _ := c.Get("userID")
 
+	// Group contests are always unrated, regardless of request
+	if req.GroupID != nil {
+		req.IsRated = false
+	}
+
+	gradeVis := req.GradeVisibility
+	if gradeVis == "" {
+		gradeVis = "private"
+	}
+	if gradeVis != "private" && gradeVis != "group" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "grade_visibility must be 'private' or 'group'"})
+		return
+	}
+
 	tx, err := h.DB.Begin(context.Background())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
@@ -446,9 +518,11 @@ func (h *Handler) CreateContest(c *gin.Context) {
 
 	var contestID int
 	err = tx.QueryRow(context.Background(),
-		`INSERT INTO app.contests (title, description, start_time, end_time, is_rated, created_by)
- VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		`INSERT INTO app.contests (title, description, start_time, end_time, is_rated, created_by,
+		                           group_id, proctored, grade_visibility)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
 		req.Title, req.Description, startTime, endTime, req.IsRated, userID,
+		req.GroupID, req.Proctored, gradeVis,
 	).Scan(&contestID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create contest"})
@@ -464,10 +538,18 @@ func (h *Handler) CreateContest(c *gin.Context) {
 		if order <= 0 {
 			order = i + 1
 		}
+		sm := p.ScoringMode
+		if sm == "" {
+			sm = "all_or_nothing"
+		}
+		if sm != "all_or_nothing" && sm != "partial" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "scoring_mode must be 'all_or_nothing' or 'partial'"})
+			return
+		}
 		_, err := tx.Exec(context.Background(),
-			`INSERT INTO app.contest_problems (contest_id, problem_id, points, problem_order)
- VALUES ($1, $2, $3, $4)`,
-			contestID, p.ProblemID, points, order,
+			`INSERT INTO app.contest_problems (contest_id, problem_id, points, problem_order, scoring_mode)
+			 VALUES ($1, $2, $3, $4, $5)`,
+			contestID, p.ProblemID, points, order, sm,
 		)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add problem to contest"})
@@ -507,12 +589,15 @@ func (h *Handler) ContestSubmit(c *gin.Context) {
 
 	userID, _ := c.Get("userID")
 	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
 
-	// Verify contest exists and is live
+	// Verify contest exists and is live; pull group info for membership check
 	var startTime, endTime time.Time
+	var groupID *int
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT start_time, end_time FROM app.contests WHERE id = $1`, contestID,
-	).Scan(&startTime, &endTime)
+		`SELECT start_time, end_time, group_id FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&startTime, &endTime, &groupID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
@@ -524,38 +609,77 @@ func (h *Handler) ContestSubmit(c *gin.Context) {
 		return
 	}
 
-	// Verify problem is in this contest
+	// Group-only visibility
+	if groupID != nil && !h.isGroupMember(context.Background(), *groupID, uid, roleStr) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You must be a member of this group to submit"})
+		return
+	}
+
+	// Verify problem is in this contest; also pull problem_type + scoring_mode
 	var points, timeLimitMs, memoryLimitMb int
-	var checkerCode, slug string
+	var checkerCode, slug, problemType, scoringMode string
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT cp.points, p.time_limit_ms, p.memory_limit_mb, p.checker_code, p.slug
- FROM app.contest_problems cp
- JOIN app.problems p ON p.id = cp.problem_id
- WHERE cp.contest_id = $1 AND cp.problem_id = $2`,
+		`SELECT cp.points, p.time_limit_ms, p.memory_limit_mb, p.checker_code, p.slug,
+		        p.problem_type, cp.scoring_mode
+		 FROM app.contest_problems cp
+		 JOIN app.problems p ON p.id = cp.problem_id
+		 WHERE cp.contest_id = $1 AND cp.problem_id = $2`,
 		contestID, req.ProblemID,
-	).Scan(&points, &timeLimitMs, &memoryLimitMb, &checkerCode, &slug)
+	).Scan(&points, &timeLimitMs, &memoryLimitMb, &checkerCode, &slug, &problemType, &scoringMode)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Problem not in this contest"})
 		return
 	}
 
-	// Check if already solved
-	var alreadySolved bool
-	h.DB.QueryRow(context.Background(),
-		`SELECT EXISTS(SELECT 1 FROM app.contest_solves WHERE contest_id=$1 AND user_id=$2 AND problem_id=$3)`,
-		contestID, uid, req.ProblemID,
-	).Scan(&alreadySolved)
-	if alreadySolved {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Already solved this problem in this contest"})
+	// Auto-join participant if not already joined (needed for both flows)
+	h.DB.Exec(context.Background(),
+		`INSERT INTO app.contest_participants (contest_id, user_id, score, penalty_time)
+		 VALUES ($1, $2, 0, 0) ON CONFLICT DO NOTHING`,
+		contestID, uid,
+	)
+
+	// ── Subjective problems: skip judge, record as pending_review ────────
+	if problemType == "subjective" {
+		var subID int
+		var submittedAt time.Time
+		err := h.DB.QueryRow(context.Background(),
+			`INSERT INTO app.submissions (user_id, problem_id, contest_id, language, source_code,
+			                              status, passed_count, total_count)
+			 VALUES ($1, $2, $3, $4, $5, 'pending_review', 0, 0)
+			 RETURNING id, submitted_at`,
+			uid, req.ProblemID, contestID, req.Language, req.Code,
+		).Scan(&subID, &submittedAt)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save submission"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"submission": SubmissionResponse{
+				ID:          subID,
+				ProblemID:   req.ProblemID,
+				ProblemSlug: slug,
+				Status:      "pending_review",
+				Language:    req.Language,
+				SubmittedAt: submittedAt,
+			},
+			"message": "Submission received and awaiting manual review.",
+		})
 		return
 	}
 
-	// Auto-join participant if not already joined
-	h.DB.Exec(context.Background(),
-		`INSERT INTO app.contest_participants (contest_id, user_id, score, penalty_time)
- VALUES ($1, $2, 0, 0) ON CONFLICT DO NOTHING`,
-		contestID, uid,
-	)
+	// Check if already solved — only applies to all-or-nothing standard problems.
+	// Partial-scoring problems allow resubmission (we take max).
+	if scoringMode != "partial" {
+		var alreadySolved bool
+		h.DB.QueryRow(context.Background(),
+			`SELECT EXISTS(SELECT 1 FROM app.contest_solves WHERE contest_id=$1 AND user_id=$2 AND problem_id=$3)`,
+			contestID, uid, req.ProblemID,
+		).Scan(&alreadySolved)
+		if alreadySolved {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Already solved this problem in this contest"})
+			return
+		}
+	}
 
 	// Fetch test cases
 	rows, err := h.DB.Query(context.Background(),
@@ -618,32 +742,62 @@ func (h *Handler) ContestSubmit(c *gin.Context) {
 		return
 	}
 
-	// If accepted, record the solve and update score
-	if result.Status == "accepted" {
-		// Penalty = minutes since contest start
-		penaltyMinutes := int(submittedAt.Sub(startTime).Minutes())
-		if penaltyMinutes < 0 {
-			penaltyMinutes = 0
+	// Scoring:
+	//   all_or_nothing: only AC → full points
+	//   partial:        earned = round(points * passed/total), keep the best solve
+	earnedPoints := 0
+	if scoringMode == "partial" {
+		if result.TotalCount > 0 {
+			earnedPoints = int(float64(points) * float64(result.PassedCount) / float64(result.TotalCount))
+		}
+	} else if result.Status == "accepted" {
+		earnedPoints = points
+	}
+
+	if earnedPoints > 0 || result.Status == "accepted" {
+		if scoringMode == "partial" {
+			// Upsert — keep the best score for this problem in this contest.
+			_, err = h.DB.Exec(context.Background(),
+				`INSERT INTO app.contest_solves
+				     (contest_id, user_id, problem_id, submission_id, points_earned, solved_at)
+				 VALUES ($1, $2, $3, $4, $5, $6)
+				 ON CONFLICT (contest_id, user_id, problem_id) DO UPDATE
+				 SET points_earned = GREATEST(app.contest_solves.points_earned, EXCLUDED.points_earned),
+				     submission_id = CASE
+				         WHEN EXCLUDED.points_earned > app.contest_solves.points_earned
+				         THEN EXCLUDED.submission_id
+				         ELSE app.contest_solves.submission_id
+				     END,
+				     solved_at = CASE
+				         WHEN EXCLUDED.points_earned > app.contest_solves.points_earned
+				         THEN EXCLUDED.solved_at
+				         ELSE app.contest_solves.solved_at
+				     END`,
+				contestID, uid, req.ProblemID, submissionID, earnedPoints, submittedAt,
+			)
+		} else {
+			_, err = h.DB.Exec(context.Background(),
+				`INSERT INTO app.contest_solves
+				     (contest_id, user_id, problem_id, submission_id, points_earned, solved_at)
+				 VALUES ($1, $2, $3, $4, $5, $6)
+				 ON CONFLICT DO NOTHING`,
+				contestID, uid, req.ProblemID, submissionID, earnedPoints, submittedAt,
+			)
 		}
 
-		_, err = h.DB.Exec(context.Background(),
-			`INSERT INTO app.contest_solves (contest_id, user_id, problem_id, submission_id, points_earned, solved_at)
- VALUES ($1, $2, $3, $4, $5, $6)
- ON CONFLICT DO NOTHING`,
-			contestID, uid, req.ProblemID, submissionID, points, submittedAt,
-		)
 		if err == nil {
-			// Update score and penalty in contest_participants
 			h.DB.Exec(context.Background(),
 				`UPDATE app.contest_participants
- SET score = (SELECT COALESCE(SUM(points_earned), 0) FROM app.contest_solves WHERE contest_id = $1 AND user_id = $2),
-     penalty_time = (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (solved_at - $3::timestamptz)) / 60)::int, 0)
-                     FROM app.contest_solves WHERE contest_id = $1 AND user_id = $2)
- WHERE contest_id = $1 AND user_id = $2`,
+				 SET score = (SELECT COALESCE(SUM(points_earned), 0)
+				              FROM app.contest_solves
+				              WHERE contest_id = $1 AND user_id = $2),
+				     penalty_time = (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (solved_at - $3::timestamptz)) / 60)::int, 0)
+				                     FROM app.contest_solves
+				                     WHERE contest_id = $1 AND user_id = $2)
+				 WHERE contest_id = $1 AND user_id = $2`,
 				contestID, uid, startTime,
 			)
 
-			// Broadcast updated rating predictions
 			go func() {
 				predictions := h.predictRatings(contestID)
 				if predictions != nil {
@@ -691,14 +845,51 @@ func (h *Handler) ContestLeaderboard(c *gin.Context) {
 		return
 	}
 
-	// Get participants sorted by score desc, penalty asc
-	rows, err := h.DB.Query(context.Background(),
-		`SELECT cp.user_id, u.username, cp.score, cp.penalty_time, u.rating,
-        cp.rating_before, cp.rating_change
- FROM app.contest_participants cp
- JOIN app.users u ON u.id = cp.user_id
- WHERE cp.contest_id = $1
- ORDER BY cp.score DESC, cp.penalty_time ASC`, contestID)
+	userID, _ := c.Get("userID")
+	uid, _ := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	// Load visibility + group info
+	var gradeVisibility string
+	var groupID *int
+	err = h.DB.QueryRow(context.Background(),
+		`SELECT grade_visibility, group_id FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&gradeVisibility, &groupID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
+		return
+	}
+
+	// Group visibility check — non-admins must be members of the group
+	if groupID != nil && roleStr != "admin" {
+		if !h.isGroupMember(context.Background(), *groupID, uid, roleStr) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "This leaderboard is restricted to group members"})
+			return
+		}
+	}
+
+	// Grade visibility:
+	//   'private' → non-admins only see their own row
+	//   'group'   → all participants see the full leaderboard
+	restrictToSelf := false
+	if gradeVisibility == "private" && roleStr != "admin" {
+		restrictToSelf = true
+	}
+
+	query := `SELECT cp.user_id, u.username, cp.score, cp.penalty_time, u.rating,
+	                 cp.rating_before, cp.rating_change
+	          FROM app.contest_participants cp
+	          JOIN app.users u ON u.id = cp.user_id
+	          WHERE cp.contest_id = $1`
+	args := []interface{}{contestID}
+	if restrictToSelf {
+		query += ` AND cp.user_id = $2`
+		args = append(args, uid)
+	}
+	query += ` ORDER BY cp.score DESC, cp.penalty_time ASC`
+
+	rows, err := h.DB.Query(context.Background(), query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
@@ -715,7 +906,6 @@ func (h *Handler) ContestLeaderboard(c *gin.Context) {
 		entries = append(entries, e)
 	}
 
-	// Assign ranks
 	for i := range entries {
 		entries[i].Rank = i + 1
 		if i > 0 && entries[i].Score == entries[i-1].Score && entries[i].PenaltyTime == entries[i-1].PenaltyTime {
@@ -723,18 +913,24 @@ func (h *Handler) ContestLeaderboard(c *gin.Context) {
 		}
 	}
 
-	// Fetch solves for each participant
-	solveRows, err := h.DB.Query(context.Background(),
-		`SELECT user_id, problem_id, points_earned, solved_at
- FROM app.contest_solves WHERE contest_id = $1`, contestID)
+	// Fetch solves (scoped same as leaderboard entries)
+	solveQuery := `SELECT user_id, problem_id, points_earned, solved_at
+	               FROM app.contest_solves WHERE contest_id = $1`
+	solveArgs := []interface{}{contestID}
+	if restrictToSelf {
+		solveQuery += ` AND user_id = $2`
+		solveArgs = append(solveArgs, uid)
+	}
+
+	solveRows, err := h.DB.Query(context.Background(), solveQuery, solveArgs...)
 	if err == nil {
 		defer solveRows.Close()
 		solveMap := make(map[int][]LeaderboardSolveEntry)
 		for solveRows.Next() {
-			var uid, pid, pts int
+			var suid, pid, pts int
 			var solvedAt time.Time
-			if err := solveRows.Scan(&uid, &pid, &pts, &solvedAt); err == nil {
-				solveMap[uid] = append(solveMap[uid], LeaderboardSolveEntry{
+			if err := solveRows.Scan(&suid, &pid, &pts, &solvedAt); err == nil {
+				solveMap[suid] = append(solveMap[suid], LeaderboardSolveEntry{
 					ProblemID:    pid,
 					PointsEarned: pts,
 					SolvedAt:     solvedAt,
@@ -749,7 +945,10 @@ func (h *Handler) ContestLeaderboard(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"leaderboard": entries})
+	c.JSON(http.StatusOK, gin.H{
+		"leaderboard":      entries,
+		"grade_visibility": gradeVisibility,
+	})
 }
 
 // ──────────────────────────────────────────────────────────────

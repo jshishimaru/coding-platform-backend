@@ -19,4 +19,9 @@ type Submission struct {
 	TotalCount    int             `json:"total_count"`
 	ResultDetails json.RawMessage `json:"result_details,omitempty"`
 	SubmittedAt   time.Time       `json:"submitted_at"`
+	ManualScore   *int            `json:"manual_score,omitempty"`
+	Feedback      string          `json:"feedback,omitempty"`
+	GradedBy      *int            `json:"graded_by,omitempty"`
+	GradedAt      *time.Time      `json:"graded_at,omitempty"`
+	IsLocked      bool            `json:"is_locked"`
 }

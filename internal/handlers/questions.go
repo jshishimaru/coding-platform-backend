@@ -38,6 +38,7 @@ type QuestionSummary struct {
 	Difficulty    string    `json:"difficulty"`
 	TimeLimitMs   int       `json:"time_limit_ms"`
 	MemoryLimitMb int       `json:"memory_limit_mb"`
+	ProblemType   string    `json:"problem_type"`
 	CreatedAt     time.Time `json:"created_at"`
 	Tags          []string  `json:"tags"`
 }
@@ -50,6 +51,7 @@ type QuestionDetail struct {
 	Difficulty    string           `json:"difficulty"`
 	TimeLimitMs   int              `json:"time_limit_ms"`
 	MemoryLimitMb int              `json:"memory_limit_mb"`
+	ProblemType   string           `json:"problem_type"`
 	CreatedAt     time.Time        `json:"created_at"`
 	Tags          []string         `json:"tags"`
 	SampleTests   []SampleTestCase `json:"sample_test_cases"`
@@ -98,7 +100,7 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 	if len(filterTags) > 0 {
 		// Only return problems that have ALL the requested tags
 		rows2, err2 := h.DB.Query(context.Background(),
-			`SELECT p.id, p.title, p.slug, p.difficulty, p.time_limit_ms, p.memory_limit_mb, p.created_at
+			`SELECT p.id, p.title, p.slug, p.difficulty, p.time_limit_ms, p.memory_limit_mb, p.problem_type, p.created_at
 			 FROM app.problems p
 			 WHERE p.id IN (
 			   SELECT pt.problem_id FROM app.problem_tags pt
@@ -116,7 +118,7 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 		defer rows2.Close()
 	} else {
 		rows2, err2 := h.DB.Query(context.Background(),
-			`SELECT id, title, slug, difficulty, time_limit_ms, memory_limit_mb, created_at
+			`SELECT id, title, slug, difficulty, time_limit_ms, memory_limit_mb, problem_type, created_at
 			 FROM app.problems ORDER BY id`)
 		if err2 != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
@@ -131,7 +133,7 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 	for rows.Next() {
 		var q QuestionSummary
 		if err := rows.Scan(&q.ID, &q.Title, &q.Slug, &q.Difficulty,
-			&q.TimeLimitMs, &q.MemoryLimitMb, &q.CreatedAt); err != nil {
+			&q.TimeLimitMs, &q.MemoryLimitMb, &q.ProblemType, &q.CreatedAt); err != nil {
 			continue
 		}
 		q.Tags = make([]string, 0)
@@ -178,9 +180,9 @@ func (h *Handler) GetQuestion(c *gin.Context) {
 
 	var q QuestionDetail
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT id, title, slug, statement, difficulty, time_limit_ms, memory_limit_mb, created_at
+		`SELECT id, title, slug, statement, difficulty, time_limit_ms, memory_limit_mb, problem_type, created_at
 		 FROM app.problems WHERE slug = $1`, slug,
-	).Scan(&q.ID, &q.Title, &q.Slug, &q.Statement, &q.Difficulty, &q.TimeLimitMs, &q.MemoryLimitMb, &q.CreatedAt)
+	).Scan(&q.ID, &q.Title, &q.Slug, &q.Statement, &q.Difficulty, &q.TimeLimitMs, &q.MemoryLimitMb, &q.ProblemType, &q.CreatedAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
 		return

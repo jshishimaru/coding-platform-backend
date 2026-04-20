@@ -21,16 +21,25 @@ type CreateSubmissionRequest struct {
 }
 
 type SubmissionResponse struct {
-	ID          int       `json:"id"`
-	ProblemID   int       `json:"problem_id"`
-	ProblemSlug string    `json:"problem_slug,omitempty"`
-	Status      string    `json:"status"`
-	Language    string    `json:"language"`
-	RuntimeMs   *int      `json:"runtime_ms,omitempty"`
-	MemoryKb    *int      `json:"memory_kb,omitempty"`
-	PassedCount int       `json:"passed_count"`
-	TotalCount  int       `json:"total_count"`
-	SubmittedAt time.Time `json:"submitted_at"`
+	ID           int        `json:"id"`
+	ProblemID    int        `json:"problem_id"`
+	ProblemSlug  string     `json:"problem_slug,omitempty"`
+	ProblemTitle string     `json:"problem_title,omitempty"`
+	ProblemType  string     `json:"problem_type,omitempty"`
+	Status       string     `json:"status"`
+	Language     string     `json:"language"`
+	RuntimeMs    *int       `json:"runtime_ms,omitempty"`
+	MemoryKb     *int       `json:"memory_kb,omitempty"`
+	PassedCount  int        `json:"passed_count"`
+	TotalCount   int        `json:"total_count"`
+	SubmittedAt  time.Time  `json:"submitted_at"`
+	ContestID    *int       `json:"contest_id,omitempty"`
+	ContestTitle string     `json:"contest_title,omitempty"`
+	ManualScore  *int       `json:"manual_score,omitempty"`
+	Feedback     string     `json:"feedback,omitempty"`
+	IsLocked     bool       `json:"is_locked"`
+	GradedAt     *time.Time `json:"graded_at,omitempty"`
+	GraderName   string     `json:"grader_name,omitempty"`
 }
 
 // ---------- Handlers ----------
@@ -55,13 +64,42 @@ func (h *Handler) CreateSubmission(c *gin.Context) {
 
 	// Fetch problem
 	var problemID, timeLimitMs, memoryLimitMb int
-	var checkerCode string
+	var checkerCode, problemType string
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT id, time_limit_ms, memory_limit_mb, checker_code
+		`SELECT id, time_limit_ms, memory_limit_mb, checker_code, problem_type
 		 FROM app.problems WHERE slug = $1`, req.ProblemSlug,
-	).Scan(&problemID, &timeLimitMs, &memoryLimitMb, &checkerCode)
+	).Scan(&problemID, &timeLimitMs, &memoryLimitMb, &checkerCode, &problemType)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
+		return
+	}
+
+	// Subjective problems: skip judging, accept as pending_review
+	if problemType == "subjective" {
+		var subID int
+		var submittedAt time.Time
+		err := h.DB.QueryRow(context.Background(),
+			`INSERT INTO app.submissions (user_id, problem_id, language, source_code,
+			                              status, passed_count, total_count)
+			 VALUES ($1, $2, $3, $4, 'pending_review', 0, 0)
+			 RETURNING id, submitted_at`,
+			userID, problemID, req.Language, req.Code,
+		).Scan(&subID, &submittedAt)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save submission"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"submission": SubmissionResponse{
+				ID:          subID,
+				ProblemID:   problemID,
+				ProblemSlug: req.ProblemSlug,
+				Status:      "pending_review",
+				Language:    req.Language,
+				SubmittedAt: submittedAt,
+			},
+			"message": "Submission received and awaiting manual review.",
+		})
 		return
 	}
 
@@ -161,24 +199,48 @@ func (h *Handler) GetSubmission(c *gin.Context) {
 		return
 	}
 
+	userID, _ := c.Get("userID")
+	uid, _ := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
 	var s SubmissionResponse
 	var resultJSON []byte
+	var ownerID int
+	var sourceCode string
+	var graderName *string
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT s.id, s.problem_id, p.slug, s.status, s.language,
+		`SELECT s.id, s.user_id, s.problem_id, p.slug, p.title, p.problem_type, s.status, s.language,
 		        s.runtime_ms, s.memory_kb, COALESCE(s.passed_count,0),
-		        COALESCE(s.total_count,0), s.submitted_at, s.result_details
+		        COALESCE(s.total_count,0), s.submitted_at, s.result_details,
+		        s.contest_id, COALESCE(c.title, ''), s.manual_score, s.feedback, s.is_locked,
+		        s.graded_at, gu.username, s.source_code
 		 FROM app.submissions s
 		 JOIN app.problems p ON p.id = s.problem_id
+		 LEFT JOIN app.contests c ON c.id = s.contest_id
+		 LEFT JOIN app.users gu ON gu.id = s.graded_by
 		 WHERE s.id = $1`, submissionID,
-	).Scan(&s.ID, &s.ProblemID, &s.ProblemSlug, &s.Status, &s.Language,
+	).Scan(&s.ID, &ownerID, &s.ProblemID, &s.ProblemSlug, &s.ProblemTitle, &s.ProblemType,
+		&s.Status, &s.Language,
 		&s.RuntimeMs, &s.MemoryKb, &s.PassedCount, &s.TotalCount,
-		&s.SubmittedAt, &resultJSON)
+		&s.SubmittedAt, &resultJSON,
+		&s.ContestID, &s.ContestTitle, &s.ManualScore, &s.Feedback, &s.IsLocked,
+		&s.GradedAt, &graderName, &sourceCode)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Submission not found"})
 		return
 	}
+	if graderName != nil {
+		s.GraderName = *graderName
+	}
 
-	response := gin.H{"submission": s}
+	// Only the owner or a site admin may view the submission detail
+	if ownerID != uid && roleStr != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden"})
+		return
+	}
+
+	response := gin.H{"submission": s, "source_code": sourceCode}
 	if resultJSON != nil {
 		var result sandbox.JudgeResult
 		if json.Unmarshal(resultJSON, &result) == nil {
@@ -187,6 +249,93 @@ func (h *Handler) GetSubmission(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+// ListMySubmissions returns the authenticated user's submission history.
+// Filters: ?contest_id=<n>&problem_slug=<s>&status=<s>&page=<n>
+func (h *Handler) ListMySubmissions(c *gin.Context) {
+	userID, _ := c.Get("userID")
+	uid, _ := userID.(int)
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	limit := 25
+	offset := (page - 1) * limit
+
+	args := []interface{}{uid}
+	query := `SELECT s.id, s.problem_id, p.slug, p.title, p.problem_type, s.status, s.language,
+	                 s.runtime_ms, s.memory_kb, COALESCE(s.passed_count,0),
+	                 COALESCE(s.total_count,0), s.submitted_at,
+	                 s.contest_id, COALESCE(c.title, ''), s.manual_score, s.feedback, s.is_locked
+	          FROM app.submissions s
+	          JOIN app.problems p ON p.id = s.problem_id
+	          LEFT JOIN app.contests c ON c.id = s.contest_id
+	          WHERE s.user_id = $1`
+	countQuery := `SELECT COUNT(*) FROM app.submissions s JOIN app.problems p ON p.id = s.problem_id WHERE s.user_id = $1`
+	countArgs := []interface{}{uid}
+	argIdx := 2
+
+	if contestIDStr := c.Query("contest_id"); contestIDStr != "" {
+		if cid, err := strconv.Atoi(contestIDStr); err == nil {
+			clause := " AND s.contest_id = $" + strconv.Itoa(argIdx)
+			query += clause
+			countQuery += clause
+			args = append(args, cid)
+			countArgs = append(countArgs, cid)
+			argIdx++
+		}
+	}
+	if slug := c.Query("problem_slug"); slug != "" {
+		clause := " AND p.slug = $" + strconv.Itoa(argIdx)
+		query += clause
+		countQuery += clause
+		args = append(args, slug)
+		countArgs = append(countArgs, slug)
+		argIdx++
+	}
+	if status := c.Query("status"); status != "" {
+		clause := " AND s.status = $" + strconv.Itoa(argIdx)
+		query += clause
+		countQuery += clause
+		args = append(args, status)
+		countArgs = append(countArgs, status)
+		argIdx++
+	}
+
+	var total int
+	_ = h.DB.QueryRow(context.Background(), countQuery, countArgs...).Scan(&total)
+
+	query += " ORDER BY s.submitted_at DESC LIMIT $" + strconv.Itoa(argIdx) +
+		" OFFSET $" + strconv.Itoa(argIdx+1)
+	args = append(args, limit, offset)
+
+	rows, err := h.DB.Query(context.Background(), query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+	defer rows.Close()
+
+	submissions := make([]SubmissionResponse, 0)
+	for rows.Next() {
+		var s SubmissionResponse
+		if err := rows.Scan(&s.ID, &s.ProblemID, &s.ProblemSlug, &s.ProblemTitle, &s.ProblemType,
+			&s.Status, &s.Language,
+			&s.RuntimeMs, &s.MemoryKb, &s.PassedCount, &s.TotalCount, &s.SubmittedAt,
+			&s.ContestID, &s.ContestTitle, &s.ManualScore, &s.Feedback, &s.IsLocked); err != nil {
+			continue
+		}
+		submissions = append(submissions, s)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":  submissions,
+		"total": total,
+		"page":  page,
+		"pages": (total + limit - 1) / limit,
+	})
 }
 
 func (h *Handler) GetUserSubmissions(c *gin.Context) {
