@@ -238,6 +238,9 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 
 				// Export
 				adminContests.GET("/:id/export.csv", h.AdminExportContestCSV)
+
+				// Plagiarism check (manual, synchronous)
+				adminContests.POST("/:id/plag-check", h.AdminContestPlagCheck)
 			}
 
 			// ── Submission management (admin grading) ─────────────────
