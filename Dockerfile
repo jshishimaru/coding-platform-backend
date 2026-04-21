@@ -20,7 +20,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /server ./cmd/server
 # Runtime stage
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates g++ libstdc++ musl-dev
+RUN apk add --no-cache ca-certificates g++ libstdc++ musl-dev util-linux
 
 # Install testlib.h for competitive programming checkers/validators/generators
 RUN wget -q -O /usr/include/testlib.h https://raw.githubusercontent.com/MikeMirzayanov/testlib/master/testlib.h

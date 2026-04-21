@@ -66,9 +66,9 @@ func (h *Handler) Register(c *gin.Context) {
 		context.Background(),
 		`INSERT INTO app.users (username, email, password_hash, role, rating)
 		 VALUES ($1, $2, $3, 'user', 1200)
-		 RETURNING id, username, email, role, rating, created_at`,
+		 RETURNING id, username, email, role, rating, is_banned, created_at`,
 		req.Username, req.Email, string(hash),
-	).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.Rating, &user.CreatedAt)
+	).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.Rating, &user.IsBanned, &user.CreatedAt)
 	if err != nil {
 		// Check for unique-violation
 		errMsg := err.Error()
@@ -110,13 +110,17 @@ func (h *Handler) Login(c *gin.Context) {
 	var passwordHash string
 	err := h.DB.QueryRow(
 		context.Background(),
-		`SELECT id, username, email, password_hash, role, rating, created_at
+		`SELECT id, username, email, password_hash, role, rating, is_banned, created_at
 		 FROM app.users
 		 WHERE username = $1 OR email = $1`,
 		req.Login,
-	).Scan(&user.ID, &user.Username, &user.Email, &passwordHash, &user.Role, &user.Rating, &user.CreatedAt)
+	).Scan(&user.ID, &user.Username, &user.Email, &passwordHash, &user.Role, &user.Rating, &user.IsBanned, &user.CreatedAt)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+	if user.IsBanned {
+		c.JSON(http.StatusForbidden, gin.H{"error": "This account has been banned"})
 		return
 	}
 
@@ -175,6 +179,7 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 				"email":            cached["email"],
 				"role":             cached["role"],
 				"rating":           cached["rating"],
+				"is_banned":        cached["is_banned"] == "true" || cached["is_banned"] == "1",
 				"created_at":       cached["created_at"],
 				"can_access_admin": canAccessAdmin,
 			})
@@ -186,11 +191,15 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 	var user models.User
 	err := h.DB.QueryRow(
 		context.Background(),
-		`SELECT id, username, email, role, rating, created_at
+		`SELECT id, username, email, role, rating, is_banned, created_at
 		 FROM app.users WHERE id = $1`, userID,
-	).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.Rating, &user.CreatedAt)
+	).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.Rating, &user.IsBanned, &user.CreatedAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+	if user.IsBanned {
+		c.JSON(http.StatusForbidden, gin.H{"error": "This account has been banned"})
 		return
 	}
 
@@ -202,6 +211,7 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 		"email":            user.Email,
 		"role":             user.Role,
 		"rating":           user.Rating,
+		"is_banned":        user.IsBanned,
 		"created_at":       user.CreatedAt,
 		"can_access_admin": canAccessAdmin,
 	})
@@ -221,9 +231,19 @@ func (h *Handler) cacheUser(user models.User) {
 		"email":      user.Email,
 		"role":       user.Role,
 		"rating":     user.Rating,
+		"is_banned":  user.IsBanned,
 		"created_at": user.CreatedAt.Format(time.RFC3339),
 	})
 	h.Redis.Expire(ctx, key, 30*time.Minute)
+}
+
+func (h *Handler) invalidateUserCache(userID int) {
+	if h.Redis == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h.Redis.Del(ctx, fmt.Sprintf("user:%d", userID))
 }
 
 func contains(s, substr string) bool {

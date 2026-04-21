@@ -17,28 +17,41 @@ import (
 // ──────────────────────────────────────────────────────────
 
 type AdminUserInfo struct {
-	ID        int       `json:"id"`
-	Username  string    `json:"username"`
-	Email     string    `json:"email"`
-	Role      string    `json:"role"`
-	Rating    int       `json:"rating"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int        `json:"id"`
+	Username  string     `json:"username"`
+	Email     string     `json:"email"`
+	Role      string     `json:"role"`
+	Rating    int        `json:"rating"`
+	IsBanned  bool       `json:"is_banned"`
+	BannedAt  *time.Time `json:"banned_at,omitempty"`
+	BannedBy  *int       `json:"banned_by,omitempty"`
+	BanReason string     `json:"ban_reason"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 type AdminUserDetail struct {
-	ID              int       `json:"id"`
-	Username        string    `json:"username"`
-	Email           string    `json:"email"`
-	Role            string    `json:"role"`
-	Rating          int       `json:"rating"`
-	CreatedAt       time.Time `json:"created_at"`
-	SubmissionCount int       `json:"submission_count"`
-	ProblemCount    int       `json:"problem_count"`
-	ContestCount    int       `json:"contest_count"`
+	ID              int        `json:"id"`
+	Username        string     `json:"username"`
+	Email           string     `json:"email"`
+	Role            string     `json:"role"`
+	Rating          int        `json:"rating"`
+	IsBanned        bool       `json:"is_banned"`
+	BannedAt        *time.Time `json:"banned_at,omitempty"`
+	BannedBy        *int       `json:"banned_by,omitempty"`
+	BanReason       string     `json:"ban_reason"`
+	CreatedAt       time.Time  `json:"created_at"`
+	SubmissionCount int        `json:"submission_count"`
+	ProblemCount    int        `json:"problem_count"`
+	ContestCount    int        `json:"contest_count"`
 }
 
 type UpdateUserRoleRequest struct {
 	Role string `json:"role" binding:"required"`
+}
+
+type UpdateUserBanRequest struct {
+	IsBanned bool   `json:"is_banned"`
+	Reason   string `json:"reason"`
 }
 
 type AuditLogEntry struct {
@@ -70,7 +83,7 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	roleFilter := c.Query("role")
 	ctx := context.Background()
 
-	query := `SELECT id, username, email, role, rating, created_at
+	query := `SELECT id, username, email, role, rating, is_banned, banned_at, banned_by, ban_reason, created_at
 	           FROM app.users WHERE 1=1`
 	countQuery := `SELECT COUNT(*) FROM app.users WHERE 1=1`
 	args := []interface{}{}
@@ -120,7 +133,8 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	users := make([]AdminUserInfo, 0)
 	for rows.Next() {
 		var u AdminUserInfo
-		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.Role, &u.Rating, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.Role, &u.Rating,
+			&u.IsBanned, &u.BannedAt, &u.BannedBy, &u.BanReason, &u.CreatedAt); err != nil {
 			continue
 		}
 		users = append(users, u)
@@ -145,8 +159,12 @@ func (h *Handler) AdminGetUser(c *gin.Context) {
 	ctx := context.Background()
 	var u AdminUserDetail
 	err = h.DB.QueryRow(ctx,
-		`SELECT id, username, email, role, rating, created_at FROM app.users WHERE id = $1`, targetID,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.Role, &u.Rating, &u.CreatedAt)
+		`SELECT id, username, email, role, rating, is_banned, banned_at, banned_by, ban_reason, created_at
+		   FROM app.users
+		  WHERE id = $1`,
+		targetID,
+	).Scan(&u.ID, &u.Username, &u.Email, &u.Role, &u.Rating,
+		&u.IsBanned, &u.BannedAt, &u.BannedBy, &u.BanReason, &u.CreatedAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -201,12 +219,86 @@ func (h *Handler) AdminUpdateUserRole(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update role"})
 		return
 	}
+	h.invalidateUserCache(targetID)
 
 	h.logAudit(uid, "user.update_role", "user", targetID, map[string]interface{}{
 		"new_role": req.Role,
 	}, c.ClientIP())
 
 	c.JSON(http.StatusOK, gin.H{"message": "Role updated"})
+}
+
+// AdminUpdateUserBan bans or unbans a user account.
+func (h *Handler) AdminUpdateUserBan(c *gin.Context) {
+	targetID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	var req UpdateUserBanRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	if targetID == uid && req.IsBanned {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot ban yourself"})
+		return
+	}
+
+	ctx := context.Background()
+	var exists bool
+	if err := h.DB.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM app.users WHERE id = $1)`, targetID,
+	).Scan(&exists); err != nil || !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	reason := strings.TrimSpace(req.Reason)
+	if req.IsBanned {
+		_, err = h.DB.Exec(ctx,
+			`UPDATE app.users
+			    SET is_banned = TRUE,
+			        banned_at = NOW(),
+			        banned_by = $1,
+			        ban_reason = $2
+			  WHERE id = $3`,
+			uid, reason, targetID,
+		)
+	} else {
+		_, err = h.DB.Exec(ctx,
+			`UPDATE app.users
+			    SET is_banned = FALSE,
+			        banned_at = NULL,
+			        banned_by = NULL,
+			        ban_reason = ''
+			  WHERE id = $1`,
+			targetID,
+		)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update ban status"})
+		return
+	}
+	h.invalidateUserCache(targetID)
+
+	action := "user.unban"
+	if req.IsBanned {
+		action = "user.ban"
+	}
+	h.logAudit(uid, action, "user", targetID, map[string]interface{}{
+		"is_banned": req.IsBanned,
+		"reason":    reason,
+	}, c.ClientIP())
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "Ban status updated",
+		"is_banned": req.IsBanned,
+	})
 }
 
 // AdminGetAuditLog returns paginated audit log entries.

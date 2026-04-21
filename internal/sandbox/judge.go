@@ -1,14 +1,10 @@
 package sandbox
 
 import (
-	"bytes"
-	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // DefaultCheckerCode is a token-by-token comparator that handles whitespace differences.
@@ -218,33 +214,41 @@ func runTestCase(tmpDir, userBin, checkerBin string, tc TestCaseInput, cfg *Conf
 
 // runChecker executes the checker binary with 3 file arguments.
 // Returns (exitCode, stdout/stderr output).
+//
+// The checker is admin-provided (not an attacker) but we still apply
+// sandbox limits: a buggy checker on a huge actual-output file could
+// otherwise memory-blow or never return. We reuse runSandboxed but with
+// stricter output/memory caps since checkers are expected to be cheap.
 func runChecker(tmpDir, checkerBin, inputFile, expectedFile, actualFile string) (int, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	cfg := &Config{
+		MaxTimeSec:     10,
+		MaxMemoryMB:    256,
+		MaxOutputBytes: 256 * 1024, // 256 KB of checker chatter is plenty
+	}
+	res := runSandboxed(tmpDir, checkerBin,
+		[]string{inputFile, expectedFile, actualFile},
+		nil, cfg)
 
-	cmd := exec.CommandContext(ctx, checkerBin, inputFile, expectedFile, actualFile)
-	cmd.Dir = tmpDir
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	output := strings.TrimSpace(stdout.String())
+	output := strings.TrimSpace(res.Stdout)
 	if output == "" {
-		output = strings.TrimSpace(stderr.String())
+		output = strings.TrimSpace(res.Stderr)
 	}
 
-	if ctx.Err() == context.DeadlineExceeded {
+	switch res.Status {
+	case "success":
+		return 0, output
+	case "time_limit_exceeded":
 		return 2, "Checker timed out"
-	}
-
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode(), output
+	case "memory_limit_exceeded":
+		return 2, "Checker exceeded memory limit"
+	case "runtime_error":
+		// Preserve the non-zero exit code the checker actually returned
+		// (e.g. 1 for "wrong answer" in the default token checker).
+		if res.ExitCode != 0 {
+			return res.ExitCode, output
 		}
-		return 2, "Checker error: " + err.Error()
+		return 2, "Checker error: " + res.Stderr
+	default:
+		return 2, "Checker error: " + res.Stderr
 	}
-
-	return 0, output
 }

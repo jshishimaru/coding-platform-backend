@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -171,183 +173,80 @@ func RunCompiledWithStdin(tmpDir, binPath, input string, cfg *Config) *Result {
 
 // compile runs g++ and returns (errorResult, compileTimeMs).
 // A nil errorResult means compilation succeeded.
+//
+// Compilation is sandboxed with its own (looser) rlimits so that malicious
+// template-metaprograms / #include bombs cannot OOM the host during a
+// submission. The compiler runs as the sandbox user when available.
 func compile(tmpDir, srcPath, binPath string) (*Result, int64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "g++",
-		"-o", binPath, srcPath,
-		"-std=c++17", "-O2",
-		"-Wall", "-Wextra",
-		"-DONLINE_JUDGE",
-		"-lm",
-	)
-	cmd.Dir = tmpDir
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	start := time.Now()
-	err := cmd.Run()
-	elapsed := time.Since(start).Milliseconds()
-
-	if ctx.Err() == context.DeadlineExceeded {
-		return &Result{
-			Status:        "compilation_error",
-			Stderr:        "Compilation timed out (30s limit)",
-			CompileTimeMs: elapsed,
-		}, elapsed
-	}
-
-	if err != nil {
-		// Sanitize paths so users don't see temp directory info
-		errMsg := stderr.String()
-		errMsg = strings.ReplaceAll(errMsg, tmpDir+"/", "")
-		errMsg = strings.ReplaceAll(errMsg, tmpDir, "")
-		return &Result{
-			Status:        "compilation_error",
-			Stderr:        errMsg,
-			CompileTimeMs: elapsed,
-		}, elapsed
-	}
-
-	return nil, elapsed
+	return compileWithFlags(tmpDir, srcPath, binPath, nil)
 }
 
 // executeWithArgs runs the compiled binary with CLI arguments (no stdin).
 // argv is a space-separated string; each token becomes a separate argument.
 func executeWithArgs(tmpDir, binPath, argv string, cfg *Config) *Result {
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		time.Duration(cfg.MaxTimeSec)*time.Second+500*time.Millisecond,
-	)
-	defer cancel()
-
-	memLimitKB := cfg.MaxMemoryMB * 1024
-	cpuTimeSec := cfg.MaxTimeSec + 2
-
-	// Quote the binary path and append each argument properly.
-	// We construct the shell command so ulimits fire before exec.
-	shellCmd := fmt.Sprintf(
-		"ulimit -v %d 2>/dev/null; ulimit -f 10240 2>/dev/null; ulimit -u 64 2>/dev/null; ulimit -t %d 2>/dev/null; exec %s %s",
-		memLimitKB, cpuTimeSec, binPath, argv,
-	)
-
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
-	cmd.Dir = tmpDir
-
-	// Empty stdin
-	cmd.Stdin = strings.NewReader("")
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &limitedWriter{w: &stdout, limit: cfg.MaxOutputBytes}
-	cmd.Stderr = &limitedWriter{w: &stderr, limit: cfg.MaxOutputBytes}
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-		Credential: &syscall.Credential{
-			Uid: 1001,
-			Gid: 1001,
-		},
-	}
-
-	start := time.Now()
-	runErr := cmd.Run()
-	elapsed := time.Since(start)
-
-	result := &Result{
-		Stdout:      stdout.String(),
-		Stderr:      stderr.String(),
-		TimeTakenMs: elapsed.Milliseconds(),
-	}
-
-	if cmd.ProcessState != nil {
-		if rusage, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
-			result.MemoryUsedKB = rusage.Maxrss
-		}
-	}
-
-	if ctx.Err() == context.DeadlineExceeded {
-		result.Status = "time_limit_exceeded"
-		result.Stderr = fmt.Sprintf("Time limit exceeded (%ds)", cfg.MaxTimeSec)
-		if cmd.Process != nil {
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		return result
-	}
-
-	if runErr != nil {
-		if exitError, ok := runErr.(*exec.ExitError); ok {
-			result.ExitCode = exitError.ExitCode()
-			if ws, ok := exitError.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				result.Status = "runtime_error"
-				result.Stderr = fmt.Sprintf("Killed by signal: %s", ws.Signal())
-			} else {
-				result.Status = "runtime_error"
-				errMsg := result.Stderr
-				if errMsg == "" {
-					errMsg = "Runtime error (exit code: " + strconv.Itoa(result.ExitCode) + ")"
-				}
-				result.Stderr = strings.ReplaceAll(errMsg, tmpDir+"/", "")
-			}
-		} else {
-			result.Status = "runtime_error"
-			result.Stderr = runErr.Error()
-		}
-		return result
-	}
-
-	result.Status = "success"
-	result.ExitCode = 0
-	return result
+	// Split argv on whitespace. This matches the existing behaviour of
+	// passing it through a shell which would word-split on spaces. It is
+	// NOT shell-safe (no quoting), but every caller today passes simple
+	// numeric/alphanumeric tokens.
+	extraArgs := strings.Fields(argv)
+	return runSandboxed(tmpDir, binPath, extraArgs, strings.NewReader(""), cfg)
 }
 
-// execute runs the compiled binary with resource limits and isolation.
+// execute runs the compiled binary fed from an input file.
 func execute(tmpDir, binPath, inputPath string, cfg *Config) *Result {
-	// Wall-clock timeout with a small buffer so ulimit fires first on CPU
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		time.Duration(cfg.MaxTimeSec)*time.Second+500*time.Millisecond,
-	)
-	defer cancel()
-
-	memLimitKB := cfg.MaxMemoryMB * 1024
-	cpuTimeSec := cfg.MaxTimeSec + 2 // CPU-time limit slightly above wall-clock
-
-	// Shell wrapper sets resource limits before exec-ing the binary.
-	// ulimit -v : virtual memory (KB)
-	// ulimit -f : max file size (KB) – 10 MB
-	// ulimit -u : max user processes – fork-bomb protection
-	// ulimit -t : CPU time (seconds)
-	shellCmd := fmt.Sprintf(
-		"ulimit -v %d 2>/dev/null; ulimit -f 10240 2>/dev/null; ulimit -u 64 2>/dev/null; ulimit -t %d 2>/dev/null; exec %s",
-		memLimitKB, cpuTimeSec, binPath,
-	)
-
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
-	cmd.Dir = tmpDir
-
-	// Feed stdin from the input file
 	inputFile, err := os.Open(inputPath)
 	if err != nil {
 		return &Result{Status: "error", Stderr: "Failed to open input"}
 	}
 	defer inputFile.Close()
-	cmd.Stdin = inputFile
+	return runSandboxed(tmpDir, binPath, nil, inputFile, cfg)
+}
+
+// runSandboxed is the single sandboxed-exec primitive used by every caller.
+// It applies kernel rlimits (via prlimit with ulimit fallback), a process
+// group for group-kill, an optional uid drop, a wall-clock context deadline,
+// and classifies the outcome into the status codes the rest of the backend
+// expects ("success", "time_limit_exceeded", "memory_limit_exceeded",
+// "runtime_error", "error").
+//
+//   - `args`  : extra argv to the child (may be nil/empty).
+//   - `stdin` : reader attached to the child's stdin (may be nil).
+//   - `cfg`   : per-submission limits (time, memory, output).
+func runSandboxed(tmpDir, binPath string, args []string, stdin io.Reader, cfg *Config) *Result {
+	// Wall-clock deadline slightly longer than the CPU budget so rlimits
+	// fire first when the program is CPU-bound; the deadline still catches
+	// purely blocked / sleeping children.
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		time.Duration(cfg.MaxTimeSec)*time.Second+500*time.Millisecond,
+	)
+	defer cancel()
+
+	// Bound global concurrency — see SANDBOX_SLOTS docs.
+	release := acquireSlot()
+	defer release()
+
+	spec := execLimits(cfg.MaxMemoryMB, cfg.MaxTimeSec+2) // +2s CPU, <0.5s wall
+
+	var cmd *exec.Cmd
+	if wrap := prlimitWrap(spec); wrap != nil {
+		// argv = [prlimit …, binPath, args…]
+		argv := append(append([]string{}, wrap...), binPath)
+		argv = append(argv, args...)
+		cmd = exec.CommandContext(ctx, argv[0], argv[1:]...)
+	} else {
+		// Fallback: /bin/sh with ulimit. Less reliable; warned at startup.
+		shellCmd := ulimitFallback(spec) +
+			"exec " + shellQuoteAll(append([]string{binPath}, args...))
+		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
+	}
+	cmd.Dir = tmpDir
+	cmd.Stdin = stdin
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &limitedWriter{w: &stdout, limit: cfg.MaxOutputBytes}
 	cmd.Stderr = &limitedWriter{w: &stderr, limit: cfg.MaxOutputBytes}
-
-	// Process-group isolation + run as sandbox user (uid/gid 1001)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-		Credential: &syscall.Credential{
-			Uid: 1001,
-			Gid: 1001,
-		},
-	}
+	applySandboxAttrs(cmd)
 
 	start := time.Now()
 	runErr := cmd.Run()
@@ -358,35 +257,39 @@ func execute(tmpDir, binPath, inputPath string, cfg *Config) *Result {
 		Stderr:      stderr.String(),
 		TimeTakenMs: elapsed.Milliseconds(),
 	}
-
-	// Collect peak memory from kernel rusage
 	if cmd.ProcessState != nil {
 		if rusage, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
-			result.MemoryUsedKB = rusage.Maxrss
+			// rusage.Maxrss is in KB on Linux but in BYTES on macOS/BSD;
+			// normalise to KB.
+			if runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" {
+				result.MemoryUsedKB = rusage.Maxrss / 1024
+			} else {
+				result.MemoryUsedKB = rusage.Maxrss
+			}
 		}
 	}
 
-	// ── Classify the outcome ─────────────────────────────────────────
+	// ── Classify the outcome ───────────────────────────────────────────
 
-	// 1. Context deadline  →  TLE
+	// 1. Context deadline → TLE. Kill the whole process group so any
+	//    children of the child also die.
 	if ctx.Err() == context.DeadlineExceeded {
 		result.Status = "time_limit_exceeded"
 		result.Stderr = fmt.Sprintf("Time limit exceeded (%ds)", cfg.MaxTimeSec)
-		// Kill entire process group
 		if cmd.Process != nil {
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		return result
 	}
 
-	// 2. Memory exceeded
+	// 2. Memory exceeded (rusage is the authoritative signal when available).
 	if result.MemoryUsedKB > int64(cfg.MaxMemoryMB)*1024 {
 		result.Status = "memory_limit_exceeded"
 		result.Stderr = fmt.Sprintf("Memory limit exceeded (%dMB)", cfg.MaxMemoryMB)
 		return result
 	}
 
-	// 3. Non-zero exit / signal
+	// 3. Non-zero exit / signal.
 	if runErr != nil {
 		if exitError, ok := runErr.(*exec.ExitError); ok {
 			result.ExitCode = exitError.ExitCode()
@@ -402,11 +305,18 @@ func execute(tmpDir, binPath, inputPath string, cfg *Config) *Result {
 					result.Status = "runtime_error"
 					result.Stderr = "Aborted (SIGABRT)"
 				case syscall.SIGKILL:
+					// SIGKILL usually means the OOM killer (rlimit AS) or our
+					// context deadline. If rusage is over the limit it's
+					// memory; otherwise treat as OOM too since the most
+					// common cause is AS being exceeded.
 					result.Status = "memory_limit_exceeded"
 					result.Stderr = fmt.Sprintf("Memory limit exceeded (%dMB) — killed by OS", cfg.MaxMemoryMB)
 				case syscall.SIGXCPU:
 					result.Status = "time_limit_exceeded"
 					result.Stderr = fmt.Sprintf("CPU time limit exceeded (%ds)", cfg.MaxTimeSec)
+				case syscall.SIGXFSZ:
+					result.Status = "runtime_error"
+					result.Stderr = "File size limit exceeded"
 				default:
 					result.Status = "runtime_error"
 					result.Stderr = fmt.Sprintf("Killed by signal: %s", ws.Signal())
@@ -426,7 +336,6 @@ func execute(tmpDir, binPath, inputPath string, cfg *Config) *Result {
 		return result
 	}
 
-	// 4. Clean exit
 	result.Status = "success"
 	result.ExitCode = 0
 	return result
@@ -499,111 +408,124 @@ func RunGeneratorWithSeed(code, extraArgs string, seed int, cfg *Config) *Result
 }
 
 // compileWithFlags is like compile but accepts extra compiler flags.
+//
+// Compilation is sandboxed: bounded memory/CPU via prlimit (with ulimit
+// fallback), 30s wall-clock deadline, 1 MB output cap per stream, and runs
+// as the sandbox user when the backend has privileges to drop uid.
 func compileWithFlags(tmpDir, srcPath, binPath string, extraFlags []string) (*Result, int64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Serialize against other heavy sandbox operations so a flood of
+	// submissions can't OOM the host via parallel g++ invocations.
+	release := acquireSlot()
+	defer release()
+
+	const compileWallSec = 30
+	ctx, cancel := context.WithTimeout(context.Background(), compileWallSec*time.Second)
 	defer cancel()
 
-	args := []string{"-o", binPath, srcPath, "-std=c++17", "-O2", "-Wall", "-Wextra", "-DONLINE_JUDGE", "-lm"}
-	args = append(args, extraFlags...)
+	gxxArgs := []string{"-o", binPath, srcPath, "-std=c++17", "-O2", "-Wall", "-Wextra", "-DONLINE_JUDGE", "-lm"}
+	gxxArgs = append(gxxArgs, extraFlags...)
 
-	cmd := exec.CommandContext(ctx, "g++", args...)
+	// Build the argv: prlimit wrapper (if available) -> g++ -> flags.
+	// CPU budget for compile is a few seconds under wall so ulimit -t fires
+	// slightly before the context deadline.
+	spec := compileLimits(compileWallSec - 2)
+	wrap := prlimitWrap(spec)
+	var cmd *exec.Cmd
+	if wrap != nil {
+		full := append(append([]string{}, wrap...), "g++")
+		full = append(full, gxxArgs...)
+		cmd = exec.CommandContext(ctx, full[0], full[1:]...)
+	} else {
+		// Fall back to a shell-based wrapper. ulimit isn't as reliable but
+		// it's better than nothing; we log at startup so ops knows.
+		shellCmd := ulimitFallback(spec) + "exec g++ " + shellQuoteAll(gxxArgs)
+		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
+	}
 	cmd.Dir = tmpDir
+	applySandboxAttrs(cmd)
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Cap compile output too — a malicious program could emit millions of
+	// warnings and OOM the server collecting them.
+	cmd.Stdout = &limitedWriter{w: &stdout, limit: 1 * 1024 * 1024}
+	cmd.Stderr = &limitedWriter{w: &stderr, limit: 1 * 1024 * 1024}
 
 	start := time.Now()
 	err := cmd.Run()
 	elapsed := time.Since(start).Milliseconds()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return &Result{Status: "compilation_error", Stderr: "Compilation timed out (30s limit)", CompileTimeMs: elapsed}, elapsed
+		if cmd.Process != nil {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return &Result{
+			Status:        "compilation_error",
+			Stderr:        fmt.Sprintf("Compilation timed out (%ds limit)", compileWallSec),
+			CompileTimeMs: elapsed,
+		}, elapsed
 	}
 	if err != nil {
 		errMsg := stderr.String()
 		errMsg = strings.ReplaceAll(errMsg, tmpDir+"/", "")
 		errMsg = strings.ReplaceAll(errMsg, tmpDir, "")
+		// If the rlimit killed g++ with SIGKILL/SIGXCPU the stderr may be
+		// empty; surface a helpful message in that case.
+		if errMsg == "" {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				if ws, ok2 := exitErr.Sys().(syscall.WaitStatus); ok2 && ws.Signaled() {
+					switch ws.Signal() {
+					case syscall.SIGKILL:
+						errMsg = "Compilation exceeded memory limit (killed by OS)"
+					case syscall.SIGXCPU:
+						errMsg = "Compilation exceeded CPU time limit"
+					default:
+						errMsg = fmt.Sprintf("Compiler killed by signal: %s", ws.Signal())
+					}
+				}
+			}
+		}
 		return &Result{Status: "compilation_error", Stderr: errMsg, CompileTimeMs: elapsed}, elapsed
 	}
 	return nil, elapsed
 }
 
+// applySandboxAttrs sets the common SysProcAttr used for every sandboxed
+// child: new process group (so we can SIGKILL the whole tree on timeout)
+// and uid drop when we have privilege to do so.
+func applySandboxAttrs(cmd *exec.Cmd) {
+	attrs := &syscall.SysProcAttr{Setpgid: true}
+	if cred := getSandboxCredential(); cred != nil {
+		attrs.Credential = cred
+	}
+	cmd.SysProcAttr = attrs
+}
+
+// shellQuoteAll joins args suitable for /bin/sh -c. Each arg is single-quoted
+// with embedded single quotes escaped. Only used for the ulimit-fallback
+// path when prlimit is unavailable; prlimit uses argv directly and doesn't
+// need shell quoting.
+func shellQuoteAll(args []string) string {
+	var b bytes.Buffer
+	for i, a := range args {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteByte('\'')
+		b.WriteString(strings.ReplaceAll(a, "'", `'\''`))
+		b.WriteByte('\'')
+	}
+	return b.String()
+}
+
 // executeGeneratorWithArgvAndStdin runs the generator with both CLI args and
-// stdin pre-seeded.
+// stdin pre-seeded, routing through the shared sandbox primitive.
 func executeGeneratorWithArgvAndStdin(tmpDir, binPath, argv, inputPath string, cfg *Config) *Result {
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		time.Duration(cfg.MaxTimeSec)*time.Second+500*time.Millisecond,
-	)
-	defer cancel()
-
-	memLimitKB := cfg.MaxMemoryMB * 1024
-	cpuTimeSec  := cfg.MaxTimeSec + 2
-
-	shellCmd := fmt.Sprintf(
-		"ulimit -v %d 2>/dev/null; ulimit -f 10240 2>/dev/null; ulimit -u 64 2>/dev/null; ulimit -t %d 2>/dev/null; exec %s %s",
-		memLimitKB, cpuTimeSec, binPath, argv,
-	)
-
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
-	cmd.Dir = tmpDir
-
 	inputFile, err := os.Open(inputPath)
 	if err != nil {
 		return &Result{Status: "error", Stderr: "Failed to open seed input"}
 	}
 	defer inputFile.Close()
-	cmd.Stdin = inputFile
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &limitedWriter{w: &stdout, limit: cfg.MaxOutputBytes}
-	cmd.Stderr = &limitedWriter{w: &stderr, limit: cfg.MaxOutputBytes}
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-		Credential: &syscall.Credential{Uid: 1001, Gid: 1001},
-	}
-
-	start   := time.Now()
-	runErr  := cmd.Run()
-	elapsed := time.Since(start)
-
-	result := &Result{
-		Stdout:      stdout.String(),
-		Stderr:      stderr.String(),
-		TimeTakenMs: elapsed.Milliseconds(),
-	}
-	if cmd.ProcessState != nil {
-		if rusage, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
-			result.MemoryUsedKB = rusage.Maxrss
-		}
-	}
-	if ctx.Err() == context.DeadlineExceeded {
-		result.Status = "time_limit_exceeded"
-		result.Stderr = fmt.Sprintf("Time limit exceeded (%ds)", cfg.MaxTimeSec)
-		if cmd.Process != nil {
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		return result
-	}
-	if runErr != nil {
-		if exitError, ok := runErr.(*exec.ExitError); ok {
-			result.ExitCode = exitError.ExitCode()
-			result.Status = "runtime_error"
-			errMsg := result.Stderr
-			if errMsg == "" {
-				errMsg = "Runtime error (exit code: " + strconv.Itoa(result.ExitCode) + ")"
-			}
-			result.Stderr = strings.ReplaceAll(errMsg, tmpDir+"/", "")
-		} else {
-			result.Status = "runtime_error"
-			result.Stderr = runErr.Error()
-		}
-		return result
-	}
-	result.Status = "success"
-	return result
+	return runSandboxed(tmpDir, binPath, strings.Fields(argv), inputFile, cfg)
 }
 
 // limitedWriter caps how much data can be buffered (prevents output flooding).

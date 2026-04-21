@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/coding-platform/backend/internal/config"
@@ -140,6 +141,39 @@ func AuthRequired(cfg *config.Config, rdb *redis.Client) gin.HandlerFunc {
 		c.Set("username", claims.Username)
 		c.Set("role", claims.Role)
 		c.Set("token", tokenString)
+
+		c.Next()
+	}
+}
+
+// RequireActiveUser rejects authenticated requests from banned accounts.
+// It is intentionally separate from token validation so public optional-auth
+// routes can still treat banned tokens as anonymous where appropriate.
+func RequireActiveUser(db *pgxpool.Pool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if db == nil {
+			c.Next()
+			return
+		}
+
+		userID, exists := c.Get("userID")
+		if !exists {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			return
+		}
+
+		var isBanned bool
+		err := db.QueryRow(context.Background(),
+			`SELECT is_banned FROM app.users WHERE id = $1`, userID,
+		).Scan(&isBanned)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+			return
+		}
+		if isBanned {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "This account has been banned"})
+			return
+		}
 
 		c.Next()
 	}

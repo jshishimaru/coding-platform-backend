@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -900,9 +901,10 @@ func (h *Handler) AdminFinalizeContestAdmin(c *gin.Context) {
 	ctx := context.Background()
 	var dbStatus string
 	var startTime, endTime time.Time
+	var isRated bool
 	err = h.DB.QueryRow(ctx,
-		`SELECT status, start_time, end_time FROM app.contests WHERE id = $1`, contestID,
-	).Scan(&dbStatus, &startTime, &endTime)
+		`SELECT status, start_time, end_time, is_rated FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&dbStatus, &startTime, &endTime, &isRated)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
@@ -919,16 +921,91 @@ func (h *Handler) AdminFinalizeContestAdmin(c *gin.Context) {
 		return
 	}
 
-	_, err = h.DB.Exec(ctx,
-		`UPDATE app.contests SET status = 'finalized' WHERE id = $1`, contestID)
+	var results []ContestRatingResult
+	if isRated {
+		results, err = h.applyContestRatings(ctx, contestID, false, true)
+		if err != nil {
+			if errors.Is(err, errRatingAlreadyApplied) {
+				if _, updateErr := h.DB.Exec(ctx,
+					`UPDATE app.contests SET status = 'finalized' WHERE id = $1`, contestID); updateErr == nil {
+					err = nil
+					results = []ContestRatingResult{}
+				}
+			}
+		}
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to apply contest ratings"})
+			return
+		}
+	} else {
+		_, err = h.DB.Exec(ctx,
+			`UPDATE app.contests SET status = 'finalized' WHERE id = $1`, contestID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to finalize contest"})
+			return
+		}
+	}
+
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	h.logAudit(uid, "contest.finalize", "contest", contestID, map[string]interface{}{
+		"is_rated":        isRated,
+		"ratings_applied": len(results),
+	}, c.ClientIP())
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Contest finalized",
+		"status":  "finalized",
+		"results": results,
+	})
+}
+
+// AdminRerunContestRating recalculates ratings for a rated, completed contest.
+func (h *Handler) AdminRerunContestRating(c *gin.Context) {
+	contestID, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to finalize contest"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid contest ID"})
+		return
+	}
+
+	ctx := context.Background()
+	var dbStatus string
+	var startTime, endTime time.Time
+	var isRated bool
+	err = h.DB.QueryRow(ctx,
+		`SELECT status, start_time, end_time, is_rated FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&dbStatus, &startTime, &endTime, &isRated)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
+		return
+	}
+	if !isRated {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Only rated contests have ratings to rerun"})
+		return
+	}
+
+	derived := AdminContestStatus(dbStatus, startTime, endTime)
+	if derived != "ended" && derived != "finalized" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Ratings can be rerun only after a contest has ended (current: " + derived + ")",
+		})
+		return
+	}
+
+	results, err := h.applyContestRatings(ctx, contestID, true, derived == "ended")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to rerun contest ratings"})
 		return
 	}
 
 	userID, _ := c.Get("userID")
 	uid := userID.(int)
-	h.logAudit(uid, "contest.finalize", "contest", contestID, nil, c.ClientIP())
+	h.logAudit(uid, "contest.rerun_rating", "contest", contestID, map[string]interface{}{
+		"ratings_applied": len(results),
+	}, c.ClientIP())
 
-	c.JSON(http.StatusOK, gin.H{"message": "Contest finalized", "status": "finalized"})
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Contest ratings rerun",
+		"results": results,
+	})
 }

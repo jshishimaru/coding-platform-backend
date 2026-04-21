@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -222,6 +223,218 @@ func calculateELO(participants []struct {
 	return result
 }
 
+var (
+	errRatingContestNotFound = errors.New("contest not found")
+	errRatingContestUnrated  = errors.New("contest is not rated")
+	errRatingAlreadyApplied  = errors.New("contest ratings already applied")
+)
+
+type ContestRatingResult struct {
+	UserID       int `json:"user_id"`
+	Rank         int `json:"rank"`
+	RatingBefore int `json:"rating_before"`
+	RatingAfter  int `json:"rating_after"`
+	RatingChange int `json:"rating_change"`
+}
+
+type contestRatingParticipant struct {
+	UserID       int
+	RatingBefore int
+	Score        int
+	Penalty      int
+}
+
+func (h *Handler) applyContestRatings(ctx context.Context, contestID int, allowRerun, markFinalized bool) ([]ContestRatingResult, error) {
+	var isRated bool
+	var contestEnd time.Time
+	if err := h.DB.QueryRow(ctx,
+		`SELECT is_rated, end_time FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&isRated, &contestEnd); err != nil {
+		return nil, errRatingContestNotFound
+	}
+	if !isRated {
+		return nil, errRatingContestUnrated
+	}
+
+	if !allowRerun {
+		var alreadyApplied bool
+		if err := h.DB.QueryRow(ctx,
+			`SELECT EXISTS(
+			    SELECT 1
+			      FROM app.contest_participants
+			     WHERE contest_id = $1
+			       AND rating_after IS NOT NULL
+			     LIMIT 1
+			)`,
+			contestID,
+		).Scan(&alreadyApplied); err != nil {
+			return nil, err
+		}
+		if alreadyApplied {
+			return nil, errRatingAlreadyApplied
+		}
+	}
+
+	rows, err := h.DB.Query(ctx,
+		`SELECT cp.user_id,
+		        COALESCE(
+		          CASE WHEN $4::boolean THEN NULL ELSE cp.rating_before END,
+		          (
+		            SELECT prev_cp.rating_after
+		              FROM app.contest_participants prev_cp
+		              JOIN app.contests prev_c ON prev_c.id = prev_cp.contest_id
+		             WHERE prev_cp.user_id = cp.user_id
+		               AND prev_cp.rating_after IS NOT NULL
+		               AND prev_c.is_rated = TRUE
+		               AND prev_c.status = 'finalized'
+		               AND (
+		                 prev_c.end_time < $2
+		                 OR (prev_c.end_time = $2 AND prev_c.id < $3)
+		               )
+		             ORDER BY prev_c.end_time DESC, prev_c.id DESC
+		             LIMIT 1
+		          ),
+		          1200
+		        ),
+		        cp.score,
+		        cp.penalty_time
+		   FROM app.contest_participants cp
+		   JOIN app.users u ON u.id = cp.user_id
+		  WHERE cp.contest_id = $1
+		    AND COALESCE(u.is_banned, FALSE) = FALSE
+		  ORDER BY cp.score DESC, cp.penalty_time ASC, cp.joined_at ASC, cp.user_id ASC`,
+		contestID, contestEnd, contestID, allowRerun,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	parts := make([]contestRatingParticipant, 0)
+	for rows.Next() {
+		var p contestRatingParticipant
+		if err := rows.Scan(&p.UserID, &p.RatingBefore, &p.Score, &p.Penalty); err != nil {
+			return nil, err
+		}
+		parts = append(parts, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	eloInput := make([]struct {
+		UserID int
+		Rating int
+		Rank   int
+	}, len(parts))
+	for i, p := range parts {
+		rank := i + 1
+		if i > 0 && parts[i].Score == parts[i-1].Score && parts[i].Penalty == parts[i-1].Penalty {
+			rank = eloInput[i-1].Rank
+		}
+		eloInput[i] = struct {
+			UserID int
+			Rating int
+			Rank   int
+		}{p.UserID, p.RatingBefore, rank}
+	}
+
+	newRatings := calculateELO(eloInput)
+
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE app.contest_participants cp
+		    SET rank = NULL,
+		        rating_before = NULL,
+		        rating_after = NULL,
+		        rating_change = NULL
+		   FROM app.users u
+		  WHERE u.id = cp.user_id
+		    AND cp.contest_id = $1
+		    AND COALESCE(u.is_banned, FALSE) = TRUE`,
+		contestID,
+	); err != nil {
+		return nil, err
+	}
+
+	results := make([]ContestRatingResult, len(parts))
+	for i, p := range parts {
+		nr := newRatings[p.UserID]
+		change := nr - p.RatingBefore
+
+		if _, err := tx.Exec(ctx,
+			`UPDATE app.contest_participants
+			    SET rank = $1,
+			        rating_before = $2,
+			        rating_after = $3,
+			        rating_change = $4
+			  WHERE contest_id = $5
+			    AND user_id = $6`,
+			eloInput[i].Rank, p.RatingBefore, nr, change, contestID, p.UserID,
+		); err != nil {
+			return nil, err
+		}
+
+		if _, err := tx.Exec(ctx,
+			`UPDATE app.users SET rating = $1 WHERE id = $2`, nr, p.UserID,
+		); err != nil {
+			return nil, err
+		}
+
+		results[i] = ContestRatingResult{
+			UserID:       p.UserID,
+			Rank:         eloInput[i].Rank,
+			RatingBefore: p.RatingBefore,
+			RatingAfter:  nr,
+			RatingChange: change,
+		}
+	}
+
+	if markFinalized {
+		if _, err := tx.Exec(ctx,
+			`UPDATE app.contests SET status = 'finalized' WHERE id = $1`, contestID,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, result := range results {
+		if _, err := tx.Exec(ctx,
+			`UPDATE app.users u
+			    SET rating = COALESCE((
+			          SELECT cp.rating_after
+			            FROM app.contest_participants cp
+			            JOIN app.contests c ON c.id = cp.contest_id
+			           WHERE cp.user_id = u.id
+			             AND cp.rating_after IS NOT NULL
+			             AND c.is_rated = TRUE
+			             AND c.status = 'finalized'
+			           ORDER BY c.end_time DESC, c.id DESC
+			           LIMIT 1
+			        ), $2)
+			  WHERE u.id = $1`,
+			result.UserID, result.RatingAfter,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	for _, result := range results {
+		h.invalidateUserCache(result.UserID)
+	}
+
+	return results, nil
+}
+
 // predictRatings is like calculateELO but returns predictions (doesn't save).
 func (h *Handler) predictRatings(contestID int) []RatingPrediction {
 	ctx := context.Background()
@@ -232,6 +445,7 @@ func (h *Handler) predictRatings(contestID int) []RatingPrediction {
  FROM app.contest_participants cp
  JOIN app.users u ON u.id = cp.user_id
  WHERE cp.contest_id = $1
+   AND COALESCE(u.is_banned, FALSE) = FALSE
  ORDER BY cp.score DESC, cp.penalty_time ASC`, contestID)
 	if err != nil {
 		return nil
@@ -1086,11 +1300,12 @@ func (h *Handler) ContestLeaderboard(c *gin.Context) {
 		restrictToSelf = true
 	}
 
-	query := `SELECT cp.user_id, u.username, cp.score, cp.penalty_time, u.rating,
+	query := `SELECT cp.user_id, u.username, cp.score, cp.penalty_time, COALESCE(cp.rating_after, u.rating),
 	                 cp.rating_before, cp.rating_change
 	          FROM app.contest_participants cp
 	          JOIN app.users u ON u.id = cp.user_id
-	          WHERE cp.contest_id = $1`
+	          WHERE cp.contest_id = $1
+	            AND COALESCE(u.is_banned, FALSE) = FALSE`
 	args := []interface{}{contestID}
 	if restrictToSelf {
 		query += ` AND cp.user_id = $2`
@@ -1172,12 +1387,15 @@ func (h *Handler) FinalizeContest(c *gin.Context) {
 		return
 	}
 
+	ctx := context.Background()
+
 	// Check contest is ended and rated
-	var endTime time.Time
+	var dbStatus string
+	var startTime, endTime time.Time
 	var isRated bool
-	err = h.DB.QueryRow(context.Background(),
-		`SELECT end_time, is_rated FROM app.contests WHERE id = $1`, contestID,
-	).Scan(&endTime, &isRated)
+	err = h.DB.QueryRow(ctx,
+		`SELECT status, start_time, end_time, is_rated FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&dbStatus, &startTime, &endTime, &isRated)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
@@ -1186,116 +1404,19 @@ func (h *Handler) FinalizeContest(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Contest is not rated"})
 		return
 	}
-	if time.Now().UTC().Before(endTime) {
+	if contestStatus(dbStatus, startTime, endTime) != "ended" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Contest has not ended yet"})
 		return
 	}
 
-	// Check not already finalized
-	var alreadyFinalized bool
-	h.DB.QueryRow(context.Background(),
-		`SELECT EXISTS(SELECT 1 FROM app.contest_participants WHERE contest_id=$1 AND rating_after IS NOT NULL LIMIT 1)`,
-		contestID,
-	).Scan(&alreadyFinalized)
-	if alreadyFinalized {
+	results, err := h.applyContestRatings(ctx, contestID, false, true)
+	if errors.Is(err, errRatingAlreadyApplied) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Contest already finalized"})
 		return
 	}
-
-	// Get participants with ranks
-	rows, err := h.DB.Query(context.Background(),
-		`SELECT cp.user_id, u.rating, cp.score, cp.penalty_time
- FROM app.contest_participants cp
- JOIN app.users u ON u.id = cp.user_id
- WHERE cp.contest_id = $1
- ORDER BY cp.score DESC, cp.penalty_time ASC`, contestID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
-	}
-	defer rows.Close()
-
-	type part struct {
-		UserID  int
-		Rating  int
-		Score   int
-		Penalty int
-	}
-	var parts []part
-	for rows.Next() {
-		var p part
-		if err := rows.Scan(&p.UserID, &p.Rating, &p.Score, &p.Penalty); err == nil {
-			parts = append(parts, p)
-		}
-	}
-
-	if len(parts) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No participants"})
-		return
-	}
-
-	// Assign ranks
-	eloInput := make([]struct {
-		UserID int
-		Rating int
-		Rank   int
-	}, len(parts))
-	for i, p := range parts {
-		rank := i + 1
-		if i > 0 && parts[i].Score == parts[i-1].Score && parts[i].Penalty == parts[i-1].Penalty {
-			rank = eloInput[i-1].Rank
-		}
-		eloInput[i] = struct {
-			UserID int
-			Rating int
-			Rank   int
-		}{p.UserID, p.Rating, rank}
-	}
-
-	newRatings := calculateELO(eloInput)
-
-	// Update in a transaction
-	tx, err := h.DB.Begin(context.Background())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
-		return
-	}
-	defer tx.Rollback(context.Background())
-
-	for i, p := range parts {
-		nr := newRatings[p.UserID]
-		change := nr - p.Rating
-
-		// Update contest_participants
-		tx.Exec(context.Background(),
-			`UPDATE app.contest_participants
- SET rank = $1, rating_before = $2, rating_after = $3, rating_change = $4
- WHERE contest_id = $5 AND user_id = $6`,
-			eloInput[i].Rank, p.Rating, nr, change, contestID, p.UserID,
-		)
-
-		// Update user rating
-		tx.Exec(context.Background(),
-			`UPDATE app.users SET rating = $1 WHERE id = $2`, nr, p.UserID,
-		)
-	}
-
-	if err := tx.Commit(context.Background()); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit"})
-		return
-	}
-
-	// Build response
-	results := make([]gin.H, len(parts))
-	for i, p := range parts {
-		nr := newRatings[p.UserID]
-		results[i] = gin.H{
-			"user_id":       p.UserID,
-			"rank":          eloInput[i].Rank,
-			"rating_before": p.Rating,
-			"rating_after":  nr,
-			"rating_change": nr - p.Rating,
-		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1436,7 +1557,11 @@ func (h *Handler) RegisterContest(c *gin.Context) {
 
 func (h *Handler) GlobalRatings(c *gin.Context) {
 	rows, err := h.DB.Query(context.Background(),
-		`SELECT id, username, rating FROM app.users ORDER BY rating DESC LIMIT 100`)
+		`SELECT id, username, rating
+		   FROM app.users
+		  WHERE COALESCE(is_banned, FALSE) = FALSE
+		  ORDER BY rating DESC
+		  LIMIT 100`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return

@@ -9,5 +9,6 @@ type User struct {
 	PasswordHash string    `json:"-"`
 	Role         string    `json:"role"`
 	Rating       int       `json:"rating"`
+	IsBanned     bool      `json:"is_banned"`
 	CreatedAt    time.Time `json:"created_at"`
 }
