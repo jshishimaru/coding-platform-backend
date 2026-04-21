@@ -9,24 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// AdminDashboard returns high-level platform stats for the admin dashboard.
-func (h *Handler) AdminDashboard(c *gin.Context) {
-	ctx := context.Background()
-
-	var problemsCount, contestsCount, usersCount, recentSubmissions int
-
-	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.problems`).Scan(&problemsCount)
-	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.contests`).Scan(&contestsCount)
-	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.users`).Scan(&usersCount)
-	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM app.submissions WHERE submitted_at >= NOW() - INTERVAL '24 hours'`).Scan(&recentSubmissions)
-
-	c.JSON(http.StatusOK, gin.H{
-		"problems_count":     problemsCount,
-		"contests_count":     contestsCount,
-		"users_count":        usersCount,
-		"recent_submissions": recentSubmissions,
-	})
-}
+// AdminDashboard has moved to admin_dashboard.go.
 
 // ──────────────────────────────────────────────────────────
 // Request / Response Types
