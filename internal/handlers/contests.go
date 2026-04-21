@@ -518,6 +518,154 @@ func (h *Handler) GetContest(c *gin.Context) {
 	c.JSON(http.StatusOK, cd)
 }
 
+func (h *Handler) loadContestProblemForRequest(c *gin.Context, contestID int, slug string) (QuestionDetail, string, int, string) {
+	userID, _ := c.Get("userID")
+	uid, _ := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+	ctx := context.Background()
+
+	var startTime, endTime time.Time
+	var groupID *int
+	var dbStatus string
+	err := h.DB.QueryRow(ctx,
+		`SELECT start_time, end_time, group_id, status
+		 FROM app.contests
+		 WHERE id = $1`, contestID,
+	).Scan(&startTime, &endTime, &groupID, &dbStatus)
+	if err != nil {
+		return QuestionDetail{}, "", http.StatusNotFound, "Contest not found"
+	}
+	if dbStatus == "draft" && roleStr != "admin" {
+		return QuestionDetail{}, "", http.StatusNotFound, "Contest not found"
+	}
+	if groupID != nil && roleStr != "admin" && !h.isGroupMember(ctx, *groupID, uid, roleStr) {
+		return QuestionDetail{}, "", http.StatusForbidden, "This contest is restricted to group members"
+	}
+
+	status := contestStatus(dbStatus, startTime, endTime)
+	if status == "upcoming" && roleStr != "admin" {
+		return QuestionDetail{}, "", http.StatusBadRequest, "Contest has not started yet"
+	}
+
+	var q QuestionDetail
+	var checkerCode string
+	err = h.DB.QueryRow(ctx,
+		`SELECT p.id, p.title, p.slug, p.statement, p.difficulty,
+		        p.time_limit_ms, p.memory_limit_mb, p.problem_type,
+		        p.created_at, p.checker_code
+		 FROM app.contest_problems cp
+		 JOIN app.problems p ON p.id = cp.problem_id
+		 WHERE cp.contest_id = $1 AND p.slug = $2`,
+		contestID, slug,
+	).Scan(&q.ID, &q.Title, &q.Slug, &q.Statement, &q.Difficulty,
+		&q.TimeLimitMs, &q.MemoryLimitMb, &q.ProblemType,
+		&q.CreatedAt, &checkerCode)
+	if err != nil {
+		return QuestionDetail{}, "", http.StatusNotFound, "Problem not found in this contest"
+	}
+
+	q.SampleTests = make([]SampleTestCase, 0)
+	rows, err := h.DB.Query(ctx,
+		`SELECT id, input, expected_output
+		 FROM app.test_cases
+		 WHERE problem_id = $1 AND is_sample = TRUE
+		 ORDER BY order_index, id`, q.ID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var tc SampleTestCase
+			if err := rows.Scan(&tc.ID, &tc.Input, &tc.ExpectedOutput); err == nil {
+				q.SampleTests = append(q.SampleTests, tc)
+			}
+		}
+	}
+
+	q.Tags = make([]string, 0)
+	tagRows, err := h.DB.Query(ctx,
+		`SELECT t.name
+		 FROM app.problem_tags pt
+		 JOIN app.tags t ON t.id = pt.tag_id
+		 WHERE pt.problem_id = $1
+		 ORDER BY t.name`, q.ID)
+	if err == nil {
+		defer tagRows.Close()
+		for tagRows.Next() {
+			var name string
+			if err := tagRows.Scan(&name); err == nil {
+				q.Tags = append(q.Tags, name)
+			}
+		}
+	}
+
+	return q, checkerCode, 0, ""
+}
+
+func (h *Handler) GetContestProblem(c *gin.Context) {
+	contestID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid contest ID"})
+		return
+	}
+
+	q, _, statusCode, message := h.loadContestProblemForRequest(c, contestID, c.Param("slug"))
+	if statusCode != 0 {
+		c.JSON(statusCode, gin.H{"error": message})
+		return
+	}
+
+	c.JSON(http.StatusOK, q)
+}
+
+func (h *Handler) RunContestProblemSamples(c *gin.Context) {
+	contestID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid contest ID"})
+		return
+	}
+
+	var req RunSampleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Language != "cpp" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Only C++ is supported currently"})
+		return
+	}
+
+	q, checkerCode, statusCode, message := h.loadContestProblemForRequest(c, contestID, c.Param("slug"))
+	if statusCode != 0 {
+		c.JSON(statusCode, gin.H{"error": message})
+		return
+	}
+	if len(q.SampleTests) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No sample test cases found"})
+		return
+	}
+
+	testCases := make([]sandbox.TestCaseInput, 0, len(q.SampleTests))
+	for _, tc := range q.SampleTests {
+		testCases = append(testCases, sandbox.TestCaseInput{
+			ID:             tc.ID,
+			Input:          tc.Input,
+			ExpectedOutput: tc.ExpectedOutput,
+			IsSample:       true,
+		})
+	}
+
+	result := sandbox.Judge(&sandbox.JudgeRequest{
+		Code:          req.Code,
+		Language:      req.Language,
+		TestCases:     testCases,
+		CheckerCode:   checkerCode,
+		TimeLimitMs:   q.TimeLimitMs,
+		MemoryLimitMB: q.MemoryLimitMb,
+	})
+
+	c.JSON(http.StatusOK, result)
+}
+
 // ──────────────────────────────────────────────────────────────
 // Create Contest (admin/protected)
 // ──────────────────────────────────────────────────────────────
