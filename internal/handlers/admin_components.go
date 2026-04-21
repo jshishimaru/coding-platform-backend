@@ -98,6 +98,10 @@ func (h *Handler) AdminCompileGenerator(c *gin.Context) {
 	h.compileComponent(c, "generators")
 }
 
+func (h *Handler) AdminActivateGenerator(c *gin.Context) {
+	h.activateComponent(c, "generators")
+}
+
 // ──────────────────────────────────────────────────────────
 // VALIDATORS
 // ──────────────────────────────────────────────────────────
@@ -229,7 +233,7 @@ func (h *Handler) listComponents(c *gin.Context, compType string) {
 	switch compType {
 	case "generators":
 		query = `SELECT g.id, g.problem_id, g.name, g.source_code, g.description,
-		                g.created_by, u.username, g.created_at, g.updated_at
+		                g.is_active, g.created_by, u.username, g.created_at, g.updated_at
 		         FROM ` + table + ` g
 		         JOIN app.users u ON u.id = g.created_by
 		         WHERE g.problem_id = $1 ORDER BY g.id`
@@ -267,11 +271,13 @@ func (h *Handler) listComponents(c *gin.Context, compType string) {
 
 		switch compType {
 		case "generators":
+			var isActive bool
 			if err := rows.Scan(&item.ID, &item.ProblemID, &item.Name, &item.SourceCode,
-				&item.Description, &item.CreatedBy, &item.CreatorName,
+				&item.Description, &isActive, &item.CreatedBy, &item.CreatorName,
 				&item.CreatedAt, &item.UpdatedAt); err != nil {
 				continue
 			}
+			item.IsActive = &isActive
 		case "validators", "interactors":
 			var isActive bool
 			var desc string
@@ -325,10 +331,17 @@ func (h *Handler) createComponent(c *gin.Context, compType string) {
 
 	switch compType {
 	case "generators":
+		// Auto-activate if this is the first generator for the problem so
+		// "Generate tests" works immediately without an extra click.
+		var existing int
+		_ = h.DB.QueryRow(ctx,
+			`SELECT COUNT(*) FROM app.problem_generators WHERE problem_id = $1`, problemID,
+		).Scan(&existing)
+		active := existing == 0
 		insertErr = h.DB.QueryRow(ctx,
-			`INSERT INTO app.problem_generators (problem_id, name, source_code, description, created_by)
-			 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-			problemID, req.Name, req.SourceCode, req.Description, uid,
+			`INSERT INTO app.problem_generators (problem_id, name, source_code, description, is_active, created_by)
+			 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+			problemID, req.Name, req.SourceCode, req.Description, active, uid,
 		).Scan(&id)
 	case "validators":
 		insertErr = h.DB.QueryRow(ctx,
@@ -527,7 +540,6 @@ func (h *Handler) compileComponent(c *gin.Context, compType string) {
 	result := sandbox.RunCpp(sourceCode, "", cfg)
 
 	compResult := CompileResult{
-		Success:       result.Status == "success" || result.Status == "compilation_error" == false,
 		CompileTimeMs: result.CompileTimeMs,
 	}
 

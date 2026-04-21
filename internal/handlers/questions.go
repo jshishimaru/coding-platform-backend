@@ -77,6 +77,18 @@ func (h *Handler) QuestionsHealth(c *gin.Context) {
 	})
 }
 
+// viewerIsSiteAdmin reports whether the current request is made by a logged-in
+// user whose site-wide role is "admin". We use this to gate draft problems.
+// Anonymous and non-admin users must never see unpublished problems.
+func viewerIsSiteAdmin(c *gin.Context) bool {
+	role, ok := c.Get("role")
+	if !ok {
+		return false
+	}
+	r, _ := role.(string)
+	return r == "admin"
+}
+
 func (h *Handler) ListQuestions(c *gin.Context) {
 	// Parse optional tag filter: ?tags=Array,Graph
 	tagFilter := c.Query("tags")
@@ -90,6 +102,9 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 		}
 	}
 
+	// Admins can preview drafts; everyone else only sees published problems.
+	publishedOnly := !viewerIsSiteAdmin(c)
+
 	var rows interface {
 		Next() bool
 		Scan(dest ...any) error
@@ -99,8 +114,7 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 
 	if len(filterTags) > 0 {
 		// Only return problems that have ALL the requested tags
-		rows2, err2 := h.DB.Query(context.Background(),
-			`SELECT p.id, p.title, p.slug, p.difficulty, p.time_limit_ms, p.memory_limit_mb, p.problem_type, p.created_at
+		query := `SELECT p.id, p.title, p.slug, p.difficulty, p.time_limit_ms, p.memory_limit_mb, p.problem_type, p.created_at
 			 FROM app.problems p
 			 WHERE p.id IN (
 			   SELECT pt.problem_id FROM app.problem_tags pt
@@ -108,8 +122,12 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 			   WHERE t.name = ANY($1)
 			   GROUP BY pt.problem_id
 			   HAVING COUNT(DISTINCT t.name) = $2
-			 )
-			 ORDER BY p.id`, filterTags, len(filterTags))
+			 )`
+		if publishedOnly {
+			query += ` AND p.published_at IS NOT NULL`
+		}
+		query += ` ORDER BY p.id`
+		rows2, err2 := h.DB.Query(context.Background(), query, filterTags, len(filterTags))
 		if err2 != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 			return
@@ -117,9 +135,13 @@ func (h *Handler) ListQuestions(c *gin.Context) {
 		rows = rows2
 		defer rows2.Close()
 	} else {
-		rows2, err2 := h.DB.Query(context.Background(),
-			`SELECT id, title, slug, difficulty, time_limit_ms, memory_limit_mb, problem_type, created_at
-			 FROM app.problems ORDER BY id`)
+		query := `SELECT id, title, slug, difficulty, time_limit_ms, memory_limit_mb, problem_type, created_at
+			 FROM app.problems`
+		if publishedOnly {
+			query += ` WHERE published_at IS NOT NULL`
+		}
+		query += ` ORDER BY id`
+		rows2, err2 := h.DB.Query(context.Background(), query)
 		if err2 != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 			return
@@ -179,11 +201,19 @@ func (h *Handler) GetQuestion(c *gin.Context) {
 	slug := c.Param("slug")
 
 	var q QuestionDetail
+	var publishedAt *time.Time
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT id, title, slug, statement, difficulty, time_limit_ms, memory_limit_mb, problem_type, created_at
+		`SELECT id, title, slug, statement, difficulty, time_limit_ms, memory_limit_mb, problem_type, created_at, published_at
 		 FROM app.problems WHERE slug = $1`, slug,
-	).Scan(&q.ID, &q.Title, &q.Slug, &q.Statement, &q.Difficulty, &q.TimeLimitMs, &q.MemoryLimitMb, &q.ProblemType, &q.CreatedAt)
+	).Scan(&q.ID, &q.Title, &q.Slug, &q.Statement, &q.Difficulty, &q.TimeLimitMs, &q.MemoryLimitMb, &q.ProblemType, &q.CreatedAt, &publishedAt)
 	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
+		return
+	}
+
+	// Draft problems must not leak to non-admins — respond as if the problem
+	// doesn't exist at all, to avoid confirming its existence by slug.
+	if publishedAt == nil && !viewerIsSiteAdmin(c) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
 		return
 	}
@@ -313,14 +343,21 @@ func (h *Handler) RunSampleTests(c *gin.Context) {
 		return
 	}
 
-	// Fetch problem limits & checker
+	// Fetch problem limits & checker. Non-admins must not be able to run
+	// sample tests against unpublished problems either — so we treat a draft
+	// problem as non-existent for them.
 	var problemID, timeLimitMs, memoryLimitMb int
 	var checkerCode string
+	var publishedAt *time.Time
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT id, time_limit_ms, memory_limit_mb, checker_code
+		`SELECT id, time_limit_ms, memory_limit_mb, checker_code, published_at
 		 FROM app.problems WHERE slug = $1`, slug,
-	).Scan(&problemID, &timeLimitMs, &memoryLimitMb, &checkerCode)
+	).Scan(&problemID, &timeLimitMs, &memoryLimitMb, &checkerCode, &publishedAt)
 	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
+		return
+	}
+	if publishedAt == nil && !viewerIsSiteAdmin(c) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
 		return
 	}

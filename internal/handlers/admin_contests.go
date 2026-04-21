@@ -497,6 +497,19 @@ func (h *Handler) AdminAddContestProblem(c *gin.Context) {
 
 	ctx := context.Background()
 
+	// Verify the problem exists. Draft (unpublished) problems are allowed
+	// inside contests on purpose: contest participants get contest-gated
+	// access to the problem through the contest detail endpoint, so adding
+	// a not-yet-public problem to a contest is a legitimate workflow.
+	var exists bool
+	err = h.DB.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM app.problems WHERE id = $1)`, req.ProblemID,
+	).Scan(&exists)
+	if err != nil || !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Problem not found"})
+		return
+	}
+
 	// Auto-assign order
 	if req.ProblemOrder <= 0 {
 		var maxOrder int

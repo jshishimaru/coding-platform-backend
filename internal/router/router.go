@@ -45,10 +45,12 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 			auth.GET("/health", h.AuthHealth)
 		}
 
-		// Question routes
+		// Question routes. List + detail are optional-auth so anonymous users
+		// see only published problems, while an authenticated admin still
+		// sees drafts for preview.
 		questions := api.Group("/questions")
 		{
-			questions.GET("", h.ListQuestions)
+			questions.GET("", authOptional, h.ListQuestions)
 			questions.GET("/health", h.QuestionsHealth)
 			questions.POST("", authRequired, h.CreateQuestion)
 		}
@@ -59,7 +61,7 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 		// Question slug routes (no static sub-paths to avoid wildcard conflicts)
 		questionBySlug := api.Group("/questions/:slug")
 		{
-			questionBySlug.GET("", h.GetQuestion)
+			questionBySlug.GET("", authOptional, h.GetQuestion)
 			questionBySlug.PUT("/tags", authRequired, h.UpdateQuestionTags)
 			questionBySlug.POST("/run", authRequired, h.RunSampleTests)
 		}
@@ -131,6 +133,14 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 				adminProblems.POST("", h.AdminCreateProblem)
 			}
 
+			// ── Tag management (setters/admins pick and create tags) ──
+			adminTags := admin.Group("/tags")
+			adminTags.Use(middleware.RequireSetterOrAbove())
+			{
+				adminTags.GET("", h.AdminListTags)
+				adminTags.POST("", h.AdminCreateTag)
+			}
+
 			// Problem-specific routes (access-controlled per problem)
 			adminProblem := admin.Group("/problems/:id")
 			{
@@ -142,8 +152,9 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 				adminProblem.GET("/revisions", middleware.RequireProblemAccess(db, "viewer"), h.AdminListRevisions)
 				adminProblem.POST("/revisions/:rev/activate", middleware.RequireProblemAccess(db, "editor"), h.AdminActivateRevision)
 
-				// Publish
+				// Publish / unpublish (toggle student-facing visibility)
 				adminProblem.POST("/publish", middleware.RequireProblemAccess(db, "editor"), h.AdminPublishProblem)
+				adminProblem.POST("/unpublish", middleware.RequireProblemAccess(db, "editor"), h.AdminUnpublishProblem)
 
 				// Access control
 				adminProblem.GET("/access", middleware.RequireProblemAccess(db, "owner"), h.AdminListProblemAccess)
@@ -154,8 +165,11 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 				adminProblem.GET("/tests", middleware.RequireProblemAccess(db, "viewer"), h.AdminListTests)
 				adminProblem.POST("/tests", middleware.RequireProblemAccess(db, "editor"), h.AdminCreateTest)
 				adminProblem.POST("/tests/bulk", middleware.RequireProblemAccess(db, "editor"), h.AdminBulkCreateTests)
+				adminProblem.DELETE("/tests/bulk", middleware.RequireProblemAccess(db, "editor"), h.AdminBulkDeleteTests)
+				adminProblem.PATCH("/tests/bulk", middleware.RequireProblemAccess(db, "editor"), h.AdminBulkPatchTests)
 				adminProblem.PUT("/tests/:testId", middleware.RequireProblemAccess(db, "editor"), h.AdminUpdateTest)
 				adminProblem.DELETE("/tests/:testId", middleware.RequireProblemAccess(db, "editor"), h.AdminDeleteTest)
+				adminProblem.POST("/tests/:testId/run-solution", middleware.RequireProblemAccess(db, "editor"), h.AdminRunSolutionOnTest)
 				adminProblem.POST("/tests/generate", middleware.RequireProblemAccess(db, "editor"), h.AdminGenerateTests)
 				adminProblem.POST("/tests/validate", middleware.RequireProblemAccess(db, "editor"), h.AdminValidateTests)
 				adminProblem.POST("/tests/reorder", middleware.RequireProblemAccess(db, "editor"), h.AdminReorderTests)
@@ -166,6 +180,7 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 				adminProblem.PUT("/generators/:compId", middleware.RequireProblemAccess(db, "editor"), h.AdminUpdateGenerator)
 				adminProblem.DELETE("/generators/:compId", middleware.RequireProblemAccess(db, "editor"), h.AdminDeleteGenerator)
 				adminProblem.POST("/generators/:compId/compile", middleware.RequireProblemAccess(db, "editor"), h.AdminCompileGenerator)
+				adminProblem.POST("/generators/:compId/activate", middleware.RequireProblemAccess(db, "editor"), h.AdminActivateGenerator)
 
 				// Validators
 				adminProblem.GET("/validators", middleware.RequireProblemAccess(db, "viewer"), h.AdminListValidators)

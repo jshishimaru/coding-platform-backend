@@ -40,36 +40,48 @@ type AdminUpdateProblemRequest struct {
 }
 
 type AdminProblemSummary struct {
-	ID            int       `json:"id"`
-	Title         string    `json:"title"`
-	Slug          string    `json:"slug"`
-	Difficulty    string    `json:"difficulty"`
-	TimeLimitMs   int       `json:"time_limit_ms"`
-	MemoryLimitMb int       `json:"memory_limit_mb"`
-	Points        *int      `json:"points"`
-	ProblemType   string    `json:"problem_type"`
-	CreatedBy     int       `json:"created_by"`
-	CreatorName   string    `json:"creator_name"`
-	TestCount     int       `json:"test_count"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID            int        `json:"id"`
+	Title         string     `json:"title"`
+	Slug          string     `json:"slug"`
+	Difficulty    string     `json:"difficulty"`
+	TimeLimitMs   int        `json:"time_limit_ms"`
+	MemoryLimitMb int        `json:"memory_limit_mb"`
+	Points        *int       `json:"points"`
+	ProblemType   string     `json:"problem_type"`
+	CreatedBy     int        `json:"created_by"`
+	CreatorName   string     `json:"creator_name"`
+	TestCount     int        `json:"test_count"`
+	CreatedAt     time.Time  `json:"created_at"`
+	PublishedAt   *time.Time `json:"published_at"`
+	Status        string     `json:"status"` // "draft" or "published"
 }
 
 type AdminProblemDetail struct {
-	ID            int       `json:"id"`
-	Title         string    `json:"title"`
-	Slug          string    `json:"slug"`
-	Statement     string    `json:"statement"`
-	Difficulty    string    `json:"difficulty"`
-	TimeLimitMs   int       `json:"time_limit_ms"`
-	MemoryLimitMb int       `json:"memory_limit_mb"`
-	CheckerCode   string    `json:"checker_code"`
-	Points        *int      `json:"points"`
-	ProblemType   string    `json:"problem_type"`
-	CreatedBy     int       `json:"created_by"`
-	CreatorName   string    `json:"creator_name"`
-	ContestID     *int      `json:"contest_id"`
-	CreatedAt     time.Time `json:"created_at"`
-	Tags          []TagInfo `json:"tags"`
+	ID            int        `json:"id"`
+	Title         string     `json:"title"`
+	Slug          string     `json:"slug"`
+	Statement     string     `json:"statement"`
+	Difficulty    string     `json:"difficulty"`
+	TimeLimitMs   int        `json:"time_limit_ms"`
+	MemoryLimitMb int        `json:"memory_limit_mb"`
+	CheckerCode   string     `json:"checker_code"`
+	Points        *int       `json:"points"`
+	ProblemType   string     `json:"problem_type"`
+	CreatedBy     int        `json:"created_by"`
+	CreatorName   string     `json:"creator_name"`
+	ContestID     *int       `json:"contest_id"`
+	CreatedAt     time.Time  `json:"created_at"`
+	PublishedAt   *time.Time `json:"published_at"`
+	Status        string     `json:"status"` // "draft" or "published"
+	Tags          []TagInfo  `json:"tags"`
+}
+
+// problemPublishStatus derives the display status from published_at.
+func problemPublishStatus(publishedAt *time.Time) string {
+	if publishedAt != nil {
+		return "published"
+	}
+	return "draft"
 }
 
 type TagInfo struct {
@@ -139,12 +151,13 @@ func (h *Handler) AdminListProblems(c *gin.Context) {
 
 	search := c.Query("search")
 	difficulty := c.Query("difficulty")
+	statusFilter := c.Query("status") // "" | "draft" | "published"
 
 	// Build query dynamically
 	query := `SELECT p.id, p.title, p.slug, p.difficulty, p.time_limit_ms, p.memory_limit_mb,
 	                  p.points, p.problem_type, p.created_by, u.username,
 	                  (SELECT COUNT(*) FROM app.test_cases WHERE problem_id = p.id),
-	                  p.created_at
+	                  p.created_at, p.published_at
 	           FROM app.problems p
 	           JOIN app.users u ON u.id = p.created_by
 	           WHERE 1=1`
@@ -183,6 +196,22 @@ func (h *Handler) AdminListProblems(c *gin.Context) {
 		argIdx++
 	}
 
+	switch statusFilter {
+	case "":
+		// no-op
+	case "draft":
+		clause := ` AND p.published_at IS NULL`
+		query += clause
+		countQuery += clause
+	case "published":
+		clause := ` AND p.published_at IS NOT NULL`
+		query += clause
+		countQuery += clause
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status filter (expected 'draft' or 'published')"})
+		return
+	}
+
 	query += ` ORDER BY p.id DESC LIMIT $` + strconv.Itoa(argIdx) + ` OFFSET $` + strconv.Itoa(argIdx+1)
 	args = append(args, limit, offset)
 
@@ -208,9 +237,10 @@ func (h *Handler) AdminListProblems(c *gin.Context) {
 		var p AdminProblemSummary
 		if err := rows.Scan(&p.ID, &p.Title, &p.Slug, &p.Difficulty,
 			&p.TimeLimitMs, &p.MemoryLimitMb, &p.Points, &p.ProblemType, &p.CreatedBy,
-			&p.CreatorName, &p.TestCount, &p.CreatedAt); err != nil {
+			&p.CreatorName, &p.TestCount, &p.CreatedAt, &p.PublishedAt); err != nil {
 			continue
 		}
+		p.Status = problemPublishStatus(p.PublishedAt)
 		problems = append(problems, p)
 	}
 
@@ -327,17 +357,18 @@ func (h *Handler) AdminGetProblem(c *gin.Context) {
 	var p AdminProblemDetail
 	err = h.DB.QueryRow(ctx,
 		`SELECT p.id, p.title, p.slug, p.statement, p.difficulty, p.time_limit_ms, p.memory_limit_mb,
-		        p.checker_code, p.points, p.problem_type, p.created_by, u.username, p.contest_id, p.created_at
+		        p.checker_code, p.points, p.problem_type, p.created_by, u.username, p.contest_id, p.created_at, p.published_at
 		 FROM app.problems p
 		 JOIN app.users u ON u.id = p.created_by
 		 WHERE p.id = $1`, problemID,
 	).Scan(&p.ID, &p.Title, &p.Slug, &p.Statement, &p.Difficulty,
 		&p.TimeLimitMs, &p.MemoryLimitMb, &p.CheckerCode, &p.Points, &p.ProblemType,
-		&p.CreatedBy, &p.CreatorName, &p.ContestID, &p.CreatedAt)
+		&p.CreatedBy, &p.CreatorName, &p.ContestID, &p.CreatedAt, &p.PublishedAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Problem not found"})
 		return
 	}
+	p.Status = problemPublishStatus(p.PublishedAt)
 
 	// Fetch tags
 	p.Tags = make([]TagInfo, 0)
@@ -652,10 +683,15 @@ func (h *Handler) AdminPublishProblem(c *gin.Context) {
 		checkerCode = activeCheckerCode
 	}
 
-	// Update the problem with active revision data + checker
+	// Update the problem with active revision data + checker, and stamp
+	// published_at to make it visible to students. Using COALESCE keeps the
+	// original publication timestamp on subsequent re-publishes (e.g. after
+	// activating a new revision) so you can tell when a problem first went
+	// live.
 	_, err = tx.Exec(ctx,
 		`UPDATE app.problems SET title=$1, statement=$2, difficulty=$3, time_limit_ms=$4,
-		        memory_limit_mb=$5, checker_code=$6, points=$7
+		        memory_limit_mb=$5, checker_code=$6, points=$7,
+		        published_at = COALESCE(published_at, NOW())
 		 WHERE id=$8`,
 		title, statement, difficulty, timeLimitMs, memoryLimitMb, checkerCode, points, problemID,
 	)
@@ -671,6 +707,95 @@ func (h *Handler) AdminPublishProblem(c *gin.Context) {
 
 	h.logAudit(uid, "problem.publish", "problem", problemID, nil, c.ClientIP())
 	c.JSON(http.StatusOK, gin.H{"message": "Problem published successfully"})
+}
+
+// AdminUnpublishProblem takes a published problem back to draft state so it
+// disappears from the student-facing listings and detail page. Existing
+// submissions are preserved; only new submissions are blocked.
+func (h *Handler) AdminUnpublishProblem(c *gin.Context) {
+	problemID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid problem ID"})
+		return
+	}
+
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	ctx := context.Background()
+
+	res, err := h.DB.Exec(ctx,
+		`UPDATE app.problems SET published_at = NULL WHERE id = $1`, problemID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unpublish problem"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Problem not found"})
+		return
+	}
+
+	h.logAudit(uid, "problem.unpublish", "problem", problemID, nil, c.ClientIP())
+	c.JSON(http.StatusOK, gin.H{"message": "Problem unpublished"})
+}
+
+// ──────────────────────────────────────────────────────────
+// Tag management (admin-side, uses IDs not names)
+// ──────────────────────────────────────────────────────────
+
+// AdminListTags returns every tag with its id and name. The public /api/tags
+// endpoint only returns names, which is insufficient for the admin UI where
+// problem.tags is persisted by id.
+func (h *Handler) AdminListTags(c *gin.Context) {
+	rows, err := h.DB.Query(context.Background(),
+		`SELECT id, name FROM app.tags ORDER BY name`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+	defer rows.Close()
+
+	tags := make([]TagInfo, 0)
+	for rows.Next() {
+		var t TagInfo
+		if err := rows.Scan(&t.ID, &t.Name); err == nil {
+			tags = append(tags, t)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"tags": tags})
+}
+
+type createTagRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+// AdminCreateTag creates a new tag and returns its id. Idempotent: if a tag
+// with the same (case-sensitive) name already exists, the existing row is
+// returned instead of erroring out, so the admin UI can treat this as
+// "upsert by name".
+func (h *Handler) AdminCreateTag(c *gin.Context) {
+	var req createTagRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Tag name cannot be empty"})
+		return
+	}
+
+	ctx := context.Background()
+	var t TagInfo
+	err := h.DB.QueryRow(ctx,
+		`INSERT INTO app.tags (name) VALUES ($1)
+		 ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+		 RETURNING id, name`, req.Name,
+	).Scan(&t.ID, &t.Name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tag"})
+		return
+	}
+	c.JSON(http.StatusCreated, t)
 }
 
 // AdminListProblemAccess lists users with access to a problem.

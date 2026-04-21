@@ -62,14 +62,20 @@ func (h *Handler) CreateSubmission(c *gin.Context) {
 
 	userID, _ := c.Get("userID")
 
-	// Fetch problem
+	// Fetch problem. A draft problem must look non-existent to non-admins so
+	// they can't submit against something that isn't meant to be visible yet.
 	var problemID, timeLimitMs, memoryLimitMb int
 	var checkerCode, problemType string
+	var publishedAt *time.Time
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT id, time_limit_ms, memory_limit_mb, checker_code, problem_type
+		`SELECT id, time_limit_ms, memory_limit_mb, checker_code, problem_type, published_at
 		 FROM app.problems WHERE slug = $1`, req.ProblemSlug,
-	).Scan(&problemID, &timeLimitMs, &memoryLimitMb, &checkerCode, &problemType)
+	).Scan(&problemID, &timeLimitMs, &memoryLimitMb, &checkerCode, &problemType, &publishedAt)
 	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
+		return
+	}
+	if publishedAt == nil && !viewerIsSiteAdmin(c) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Question not found"})
 		return
 	}
