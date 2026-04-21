@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -126,29 +127,49 @@ func (h *Handler) AdminListContests(c *gin.Context) {
 	offset := (page - 1) * limit
 
 	statusFilter := c.Query("status")
+	groupIDFilter := c.Query("group_id")
 	ctx := context.Background()
+
+	filters := make([]string, 0, 2)
+	filterArgs := make([]interface{}, 0, 2)
+	argIdx := 1
 
 	// Map the requested *derived* status back to a DB predicate. The DB only
 	// stores lifecycle states (draft/upcoming/finalized); running/ended are
 	// derived from timestamps relative to NOW(). Keeping this mapping in SQL
 	// ensures pagination counts are consistent with the visible rows.
-	var filterClause string
-	var filterArgs []interface{}
 	switch statusFilter {
 	case "":
 		// no filter
 	case "draft", "finalized":
-		filterClause = ` AND c.status = $1`
-		filterArgs = []interface{}{statusFilter}
+		filters = append(filters, `c.status = $`+strconv.Itoa(argIdx))
+		filterArgs = append(filterArgs, statusFilter)
+		argIdx++
 	case "upcoming":
-		filterClause = ` AND c.status = 'upcoming' AND c.start_time > NOW()`
+		filters = append(filters, `c.status = 'upcoming' AND c.start_time > NOW()`)
 	case "running":
-		filterClause = ` AND c.status = 'upcoming' AND c.start_time <= NOW() AND c.end_time >= NOW()`
+		filters = append(filters, `c.status = 'upcoming' AND c.start_time <= NOW() AND c.end_time >= NOW()`)
 	case "ended":
-		filterClause = ` AND c.status = 'upcoming' AND c.end_time < NOW()`
+		filters = append(filters, `c.status = 'upcoming' AND c.end_time < NOW()`)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status filter"})
 		return
+	}
+
+	if groupIDFilter != "" {
+		groupID, err := strconv.Atoi(groupIDFilter)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid group_id"})
+			return
+		}
+		filters = append(filters, `c.group_id = $`+strconv.Itoa(argIdx))
+		filterArgs = append(filterArgs, groupID)
+		argIdx++
+	}
+
+	filterClause := ""
+	if len(filters) > 0 {
+		filterClause = ` AND ` + strings.Join(filters, ` AND `)
 	}
 
 	baseQuery := `SELECT c.id, c.title, c.start_time, c.end_time, c.is_rated, c.scoring_type,

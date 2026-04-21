@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -82,7 +83,7 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	limit := 20
 	offset := (page - 1) * limit
 
-	search := c.Query("search")
+	search := strings.TrimSpace(c.Query("search"))
 	roleFilter := c.Query("role")
 	ctx := context.Background()
 
@@ -94,13 +95,22 @@ func (h *Handler) AdminListUsers(c *gin.Context) {
 	argIdx := 1
 
 	if search != "" {
-		clause := ` AND (LOWER(username) LIKE $` + strconv.Itoa(argIdx) + ` OR LOWER(email) LIKE $` + strconv.Itoa(argIdx) + `)`
-		query += clause
-		countQuery += clause
-		searchTerm := "%" + search + "%"
-		args = append(args, searchTerm)
-		countArgs = append(countArgs, searchTerm)
-		argIdx++
+		searchTerm := "%" + strings.ToLower(search) + "%"
+		if searchID, err := strconv.Atoi(search); err == nil {
+			clause := ` AND (id = $` + strconv.Itoa(argIdx) + ` OR LOWER(username) LIKE $` + strconv.Itoa(argIdx+1) + ` OR LOWER(email) LIKE $` + strconv.Itoa(argIdx+1) + `)`
+			query += clause
+			countQuery += clause
+			args = append(args, searchID, searchTerm)
+			countArgs = append(countArgs, searchID, searchTerm)
+			argIdx += 2
+		} else {
+			clause := ` AND (LOWER(username) LIKE $` + strconv.Itoa(argIdx) + ` OR LOWER(email) LIKE $` + strconv.Itoa(argIdx) + `)`
+			query += clause
+			countQuery += clause
+			args = append(args, searchTerm)
+			countArgs = append(countArgs, searchTerm)
+			argIdx++
+		}
 	}
 	if roleFilter != "" {
 		clause := ` AND role = $` + strconv.Itoa(argIdx)
