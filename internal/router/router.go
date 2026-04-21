@@ -75,11 +75,13 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 			// Listing & detail: optional auth so we can filter by group membership
 			// when logged in, while still serving global contests to anonymous users.
 			contests.GET("", authOptional, h.ListContests)
+			contests.GET("/:id/problems/:slug", authRequired, h.GetContestProblem)
 			contests.GET("/:id", authOptional, h.GetContest)
 			contests.GET("/:id/leaderboard", authOptional, h.ContestLeaderboard)
 			contests.GET("/:id/ratings/predict", h.ContestRatingPredict)
 			contests.GET("/:id/ratings/stream", h.ContestRatingStream)
 			contests.POST("", authRequired, h.CreateContest)
+			contests.POST("/:id/problems/:slug/run", authRequired, h.RunContestProblemSamples)
 			contests.POST("/:id/submit", authRequired, h.ContestSubmit)
 			contests.POST("/:id/finalize", authRequired, h.FinalizeContest)
 			contests.POST("/:id/proctor-events", authRequired, h.RecordProctorEvent)
