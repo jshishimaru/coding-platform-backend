@@ -109,6 +109,21 @@ func (h *Handler) AdminListProctorEvents(c *gin.Context) {
 		return
 	}
 
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(context.Background(), uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only access proctoring data for managed group contests"})
+		return
+	}
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if page < 1 {
 		page = 1
@@ -182,6 +197,21 @@ func (h *Handler) AdminProctorSummary(c *gin.Context) {
 	contestID, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid contest ID"})
+		return
+	}
+
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(context.Background(), uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only access proctoring data for managed group contests"})
 		return
 	}
 

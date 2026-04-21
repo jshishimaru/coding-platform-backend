@@ -122,14 +122,13 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 
 		// ── Admin routes ──────────────────────────────────────────────
 		admin := api.Group("/admin")
-		admin.Use(authRequired)
+		admin.Use(authRequired, middleware.RequireAdminSiteAccess(db))
 		{
 			// ── Dashboard ─────────────────────────────────────────────
 			admin.GET("/dashboard", middleware.RequireSetterOrAbove(), h.AdminDashboard)
 
 			// ── Problem management ────────────────────────────────────
 			adminProblems := admin.Group("/problems")
-			adminProblems.Use(middleware.RequireSetterOrAbove())
 			{
 				adminProblems.GET("", h.AdminListProblems)
 				adminProblems.POST("", h.AdminCreateProblem)
@@ -137,7 +136,6 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 
 			// ── Tag management (setters/admins pick and create tags) ──
 			adminTags := admin.Group("/tags")
-			adminTags.Use(middleware.RequireSetterOrAbove())
 			{
 				adminTags.GET("", h.AdminListTags)
 				adminTags.POST("", h.AdminCreateTag)
@@ -222,7 +220,6 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 
 			// ── Contest management ────────────────────────────────────
 			adminContests := admin.Group("/contests")
-			adminContests.Use(middleware.RequireSetterOrAbove())
 			{
 				adminContests.GET("", h.AdminListContests)
 				adminContests.POST("", h.AdminCreateContest)
@@ -245,7 +242,6 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 
 			// ── Submission management (admin grading) ─────────────────
 			adminSubmissions := admin.Group("/submissions")
-			adminSubmissions.Use(middleware.RequireSetterOrAbove())
 			{
 				adminSubmissions.GET("", h.AdminListSubmissions)
 				adminSubmissions.GET("/:id", h.AdminGetSubmission)

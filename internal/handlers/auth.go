@@ -27,8 +27,9 @@ type LoginRequest struct {
 }
 
 type AuthResponse struct {
-	Token string      `json:"token"`
-	User  models.User `json:"user"`
+	Token          string      `json:"token"`
+	User           models.User `json:"user"`
+	CanAccessAdmin bool        `json:"can_access_admin"`
 }
 
 // ---------- Handlers ----------
@@ -93,7 +94,8 @@ func (h *Handler) Register(c *gin.Context) {
 	// Cache user in Redis
 	h.cacheUser(user)
 
-	c.JSON(http.StatusCreated, AuthResponse{Token: token, User: user})
+	canAccessAdmin, _ := h.userCanAccessAdmin(context.Background(), user.ID, user.Role)
+	c.JSON(http.StatusCreated, AuthResponse{Token: token, User: user, CanAccessAdmin: canAccessAdmin})
 }
 
 func (h *Handler) Login(c *gin.Context) {
@@ -134,7 +136,8 @@ func (h *Handler) Login(c *gin.Context) {
 	// Cache user in Redis
 	h.cacheUser(user)
 
-	c.JSON(http.StatusOK, AuthResponse{Token: token, User: user})
+	canAccessAdmin, _ := h.userCanAccessAdmin(context.Background(), user.ID, user.Role)
+	c.JSON(http.StatusOK, AuthResponse{Token: token, User: user, CanAccessAdmin: canAccessAdmin})
 }
 
 func (h *Handler) Logout(c *gin.Context) {
@@ -164,13 +167,16 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 		defer cancel()
 		cached, err := h.Redis.HGetAll(ctx, fmt.Sprintf("user:%d", userID)).Result()
 		if err == nil && len(cached) > 0 {
+			uid, _ := userID.(int)
+			canAccessAdmin, _ := h.userCanAccessAdmin(context.Background(), uid, cached["role"])
 			c.JSON(http.StatusOK, gin.H{
-				"id":         userID,
-				"username":   cached["username"],
-				"email":      cached["email"],
-				"role":       cached["role"],
-				"rating":     cached["rating"],
-				"created_at": cached["created_at"],
+				"id":               userID,
+				"username":         cached["username"],
+				"email":            cached["email"],
+				"role":             cached["role"],
+				"rating":           cached["rating"],
+				"created_at":       cached["created_at"],
+				"can_access_admin": canAccessAdmin,
 			})
 			return
 		}
@@ -189,7 +195,16 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 	}
 
 	h.cacheUser(user)
-	c.JSON(http.StatusOK, user)
+	canAccessAdmin, _ := h.userCanAccessAdmin(context.Background(), user.ID, user.Role)
+	c.JSON(http.StatusOK, gin.H{
+		"id":               user.ID,
+		"username":         user.Username,
+		"email":            user.Email,
+		"role":             user.Role,
+		"rating":           user.Rating,
+		"created_at":       user.CreatedAt,
+		"can_access_admin": canAccessAdmin,
+	})
 }
 
 // ---------- Helpers ----------

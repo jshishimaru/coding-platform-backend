@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -63,6 +64,11 @@ type RunSubmissionRequest struct {
 // AdminListSubmissions returns all submissions with rich filters:
 // ?contest_id=&user_id=&problem_id=&status=&problem_type=&locked=&page=
 func (h *Handler) AdminListSubmissions(c *gin.Context) {
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if page < 1 {
 		page = 1
@@ -87,6 +93,38 @@ func (h *Handler) AdminListSubmissions(c *gin.Context) {
 	               WHERE 1=1`
 	countArgs := []interface{}{}
 	argIdx := 1
+
+	if !h.isPrivilegedAdminRole(roleStr) {
+		managedGroups, err := h.managedGroupIDs(context.Background(), uid, roleStr)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load managed groups"})
+			return
+		}
+		if len(managedGroups) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"data":  []AdminSubmissionSummary{},
+				"total": 0,
+				"page":  page,
+				"pages": 0,
+			})
+			return
+		}
+
+		placeholders := make([]string, 0, len(managedGroups))
+		for _, groupID := range managedGroups {
+			placeholders = append(placeholders, "$"+strconv.Itoa(argIdx))
+			args = append(args, groupID)
+			countArgs = append(countArgs, groupID)
+			argIdx++
+		}
+		clause := ` AND s.contest_id IS NOT NULL AND EXISTS (
+			SELECT 1
+			FROM app.contests c2
+			WHERE c2.id = s.contest_id AND c2.group_id IN (` + strings.Join(placeholders, ",") + `)
+		)`
+		query += clause
+		countQuery += clause
+	}
 
 	addFilter := func(clause string, vals ...interface{}) {
 		query += clause
@@ -162,6 +200,36 @@ func (h *Handler) AdminGetSubmission(c *gin.Context) {
 		return
 	}
 
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	if !h.isPrivilegedAdminRole(roleStr) {
+		var contestID *int
+		err = h.DB.QueryRow(context.Background(),
+			`SELECT contest_id FROM app.submissions WHERE id = $1`, submissionID,
+		).Scan(&contestID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Submission not found"})
+			return
+		}
+		if contestID == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only view submissions from managed group contests"})
+			return
+		}
+
+		canManageContest, err := h.canManageContest(context.Background(), uid, roleStr, *contestID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate submission permissions"})
+			return
+		}
+		if !canManageContest {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only view submissions from managed group contests"})
+			return
+		}
+	}
+
 	var sd AdminSubmissionDetail
 	var grader *string
 	var resultJSON []byte
@@ -223,6 +291,8 @@ func (h *Handler) AdminGradeSubmission(c *gin.Context) {
 	ctx := context.Background()
 	userID, _ := c.Get("userID")
 	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
 
 	// Check if already locked (only unlock-then-regrade allowed)
 	var isLocked bool
@@ -240,6 +310,22 @@ func (h *Handler) AdminGradeSubmission(c *gin.Context) {
 	if isLocked && (req.ManualScore != nil || req.Status != nil) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Submission is locked. Unlock before regrading."})
 		return
+	}
+
+	if !h.isPrivilegedAdminRole(roleStr) {
+		if contestID == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only grade submissions from managed group contests"})
+			return
+		}
+		canManageContest, err := h.canManageContest(ctx, uid, roleStr, *contestID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate submission permissions"})
+			return
+		}
+		if !canManageContest {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only grade submissions from managed group contests"})
+			return
+		}
 	}
 
 	updates := []string{}
@@ -360,6 +446,35 @@ func (h *Handler) AdminRunSubmission(c *gin.Context) {
 
 	var req RunSubmissionRequest
 	_ = c.ShouldBindJSON(&req)
+
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	if !h.isPrivilegedAdminRole(roleStr) {
+		var contestID *int
+		err = h.DB.QueryRow(context.Background(),
+			`SELECT contest_id FROM app.submissions WHERE id = $1`, submissionID,
+		).Scan(&contestID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Submission not found"})
+			return
+		}
+		if contestID == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only run submissions from managed group contests"})
+			return
+		}
+		canManageContest, err := h.canManageContest(context.Background(), uid, roleStr, *contestID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate submission permissions"})
+			return
+		}
+		if !canManageContest {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only run submissions from managed group contests"})
+			return
+		}
+	}
 
 	var sourceCode, language string
 	var timeLimitMs, memoryLimitMb int

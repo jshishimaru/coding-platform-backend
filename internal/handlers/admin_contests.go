@@ -119,6 +119,11 @@ type UpdateContestProblemRequest struct {
 
 // AdminListContests lists all contests with admin details.
 func (h *Handler) AdminListContests(c *gin.Context) {
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if page < 1 {
 		page = 1
@@ -133,6 +138,31 @@ func (h *Handler) AdminListContests(c *gin.Context) {
 	filters := make([]string, 0, 2)
 	filterArgs := make([]interface{}, 0, 2)
 	argIdx := 1
+
+	if !h.isPrivilegedAdminRole(roleStr) {
+		managedGroups, err := h.managedGroupIDs(ctx, uid, roleStr)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load managed groups"})
+			return
+		}
+		if len(managedGroups) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"data":  []AdminContestSummary{},
+				"total": 0,
+				"page":  page,
+				"pages": 0,
+			})
+			return
+		}
+
+		placeholders := make([]string, 0, len(managedGroups))
+		for _, groupID := range managedGroups {
+			placeholders = append(placeholders, `$`+strconv.Itoa(argIdx))
+			filterArgs = append(filterArgs, groupID)
+			argIdx++
+		}
+		filters = append(filters, `c.group_id IN (`+strings.Join(placeholders, ",")+`)`)
+	}
 
 	// Map the requested *derived* status back to a DB predicate. The DB only
 	// stores lifecycle states (draft/upcoming/finalized); running/ended are
@@ -246,7 +276,25 @@ func (h *Handler) AdminCreateContest(c *gin.Context) {
 
 	userID, _ := c.Get("userID")
 	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
 	ctx := context.Background()
+
+	if !h.isPrivilegedAdminRole(roleStr) {
+		if req.GroupID == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "group_id is required for instructor contests"})
+			return
+		}
+		canManage, err := h.canManageGroup(ctx, uid, roleStr, *req.GroupID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate group permissions"})
+			return
+		}
+		if !canManage {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only create contests for groups you administer"})
+			return
+		}
+	}
 
 	// Group contests are always unrated
 	if req.GroupID != nil {
@@ -293,6 +341,21 @@ func (h *Handler) AdminGetContest(c *gin.Context) {
 	}
 
 	ctx := context.Background()
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(ctx, uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
+		return
+	}
+
 	var cd AdminContestDetail
 	var dbStatus string
 	err = h.DB.QueryRow(ctx,
@@ -353,15 +416,54 @@ func (h *Handler) AdminUpdateContest(c *gin.Context) {
 
 	ctx := context.Background()
 
-	// Check creator or admin
+	// Check creator/admin for privileged roles; instructor users are scoped by group admin rights.
 	userID, _ := c.Get("userID")
 	uid := userID.(int)
 	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
 
 	var createdBy int
-	_ = h.DB.QueryRow(ctx, `SELECT created_by FROM app.contests WHERE id = $1`, contestID).Scan(&createdBy)
-	if role != "admin" && createdBy != uid {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only the contest creator or admin can edit"})
+	var existingGroupID *int
+	err = h.DB.QueryRow(ctx, `SELECT created_by, group_id FROM app.contests WHERE id = $1`, contestID).Scan(&createdBy, &existingGroupID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
+		return
+	}
+
+	if h.isPrivilegedAdminRole(roleStr) {
+		if roleStr != "admin" && createdBy != uid {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Only the contest creator or admin can edit"})
+			return
+		}
+	} else {
+		canManageContest, err := h.canManageContest(ctx, uid, roleStr, contestID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+			return
+		}
+		if !canManageContest {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit contests for groups you administer"})
+			return
+		}
+		if req.ClearGroup != nil && *req.ClearGroup {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "group_id cannot be cleared for instructor contests"})
+			return
+		}
+	}
+
+	if req.GroupID != nil {
+		canManageGroup, err := h.canManageGroup(ctx, uid, roleStr, *req.GroupID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate group permissions"})
+			return
+		}
+		if !canManageGroup {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only publish contests to groups you administer"})
+			return
+		}
+	}
+	if !h.isPrivilegedAdminRole(roleStr) && req.GroupID == nil && existingGroupID == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group_id is required for instructor contests"})
 		return
 	}
 
@@ -436,6 +538,9 @@ func (h *Handler) AdminUpdateContest(c *gin.Context) {
 		args = append(args, *req.GroupID)
 		argIdx++
 		// Group contests are always unrated
+		updates = append(updates, "is_rated = FALSE")
+	}
+	if !h.isPrivilegedAdminRole(roleStr) {
 		updates = append(updates, "is_rated = FALSE")
 	}
 
@@ -517,6 +622,20 @@ func (h *Handler) AdminAddContestProblem(c *gin.Context) {
 	}
 
 	ctx := context.Background()
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(ctx, uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only modify contests for groups you administer"})
+		return
+	}
 
 	// Verify the problem exists. Draft (unpublished) problems are allowed
 	// inside contests on purpose: contest participants get contest-gated
@@ -566,8 +685,6 @@ func (h *Handler) AdminAddContestProblem(c *gin.Context) {
 		return
 	}
 
-	userID, _ := c.Get("userID")
-	uid := userID.(int)
 	h.logAudit(uid, "contest.add_problem", "contest", contestID, map[string]interface{}{
 		"problem_id": req.ProblemID, "max_points": req.MaxPoints,
 	}, c.ClientIP())
@@ -595,6 +712,21 @@ func (h *Handler) AdminUpdateContestProblem(c *gin.Context) {
 	}
 
 	ctx := context.Background()
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(ctx, uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only modify contests for groups you administer"})
+		return
+	}
+
 	updates := []string{}
 	args := []interface{}{}
 	argIdx := 1
@@ -662,7 +794,23 @@ func (h *Handler) AdminRemoveContestProblem(c *gin.Context) {
 		return
 	}
 
-	_, err = h.DB.Exec(context.Background(),
+	ctx := context.Background()
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(ctx, uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only modify contests for groups you administer"})
+		return
+	}
+
+	_, err = h.DB.Exec(ctx,
 		`DELETE FROM app.contest_problems WHERE id = $1 AND contest_id = $2`, cpID, contestID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove problem"})
@@ -681,6 +829,33 @@ func (h *Handler) AdminPublishContest(c *gin.Context) {
 	}
 
 	ctx := context.Background()
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(ctx, uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only publish contests for groups you administer"})
+		return
+	}
+
+	if !h.isPrivilegedAdminRole(roleStr) {
+		groupID, err := h.contestGroupID(ctx, contestID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest group"})
+			return
+		}
+		if groupID == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Instructor contests must be published to a managed group"})
+			return
+		}
+	}
+
 	var status string
 	err = h.DB.QueryRow(ctx, `SELECT status FROM app.contests WHERE id = $1`, contestID).Scan(&status)
 	if err != nil {
@@ -709,8 +884,6 @@ func (h *Handler) AdminPublishContest(c *gin.Context) {
 		return
 	}
 
-	userID, _ := c.Get("userID")
-	uid := userID.(int)
 	h.logAudit(uid, "contest.publish", "contest", contestID, nil, c.ClientIP())
 
 	c.JSON(http.StatusOK, gin.H{"message": "Contest published", "status": "upcoming"})

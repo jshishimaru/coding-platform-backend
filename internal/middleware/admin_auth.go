@@ -55,6 +55,56 @@ func RequireTesterOrAbove() gin.HandlerFunc {
 	return RequireRole("admin", "setter", "tester")
 }
 
+// RequireAdminSiteAccess allows access to the admin site for either
+// privileged site roles (admin/setter/tester) or users who are admin in at
+// least one group.
+func RequireAdminSiteAccess(db *pgxpool.Pool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, exists := c.Get("role")
+		if !exists {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			return
+		}
+
+		roleStr, _ := role.(string)
+		if roleStr == "admin" || roleStr == "setter" || roleStr == "tester" {
+			c.Next()
+			return
+		}
+
+		userID, ok := c.Get("userID")
+		uid, uidOK := userID.(int)
+		if !ok || !uidOK {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		var hasGroupAdmin bool
+		err := db.QueryRow(ctx,
+			`SELECT EXISTS(
+				SELECT 1
+				FROM app.group_members
+				WHERE user_id = $1 AND role = 'admin'
+			)`,
+			uid,
+		).Scan(&hasGroupAdmin)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify permissions"})
+			return
+		}
+
+		if !hasGroupAdmin {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+			return
+		}
+
+		c.Next()
+	}
+}
+
 // RequireMinRole enforces a minimum role level using the role hierarchy.
 func RequireMinRole(minRole string) gin.HandlerFunc {
 	minLevel, ok := roleLevel[minRole]

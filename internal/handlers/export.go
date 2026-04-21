@@ -13,14 +13,30 @@ import (
 
 // AdminExportContestCSV streams contest results as a CSV file.
 // Columns: rank, username, email, score, penalty_minutes,
-//          rating_before, rating_after, rating_change,
-//          <per-problem columns: P<order>_score>, submitted_count
+//
+//	rating_before, rating_after, rating_change,
+//	<per-problem columns: P<order>_score>, submitted_count
 //
 // Works for both global and group contests.
 func (h *Handler) AdminExportContestCSV(c *gin.Context) {
 	contestID, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid contest ID"})
+		return
+	}
+
+	userID, _ := c.Get("userID")
+	uid := userID.(int)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+
+	canManageContest, err := h.canManageContest(context.Background(), uid, roleStr, contestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate contest permissions"})
+		return
+	}
+	if !canManageContest {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only export contests for managed group contests"})
 		return
 	}
 
@@ -182,12 +198,9 @@ func (h *Handler) AdminExportContestCSV(c *gin.Context) {
 	w.Flush()
 
 	// Audit log
-	userID, _ := c.Get("userID")
-	if uid, ok := userID.(int); ok {
-		h.logAudit(uid, "contest.export", "contest", contestID, map[string]interface{}{
-			"participants": len(participants),
-		}, c.ClientIP())
-	}
+	h.logAudit(uid, "contest.export", "contest", contestID, map[string]interface{}{
+		"participants": len(participants),
+	}, c.ClientIP())
 }
 
 // sanitize returns a filename-safe lowercased version of s.
