@@ -59,6 +59,14 @@ func Setup(db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) *gin.Engine 
 		// Tags routes (separate from /questions/:slug to avoid Gin routing conflicts)
 		api.GET("/tags", h.ListTags)
 
+		// Saved code drafts: one current draft per user/problem.
+		codeDrafts := api.Group("/code-drafts")
+		codeDrafts.Use(authRequired, activeUser)
+		{
+			codeDrafts.GET("/problems/:problemId", h.GetProblemCodeDraft)
+			codeDrafts.PUT("/problems/:problemId", h.UpsertProblemCodeDraft)
+		}
+
 		// Question slug routes (no static sub-paths to avoid wildcard conflicts)
 		questionBySlug := api.Group("/questions/:slug")
 		{

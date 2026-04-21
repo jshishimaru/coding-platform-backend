@@ -1069,6 +1069,7 @@ func (h *Handler) ContestSubmit(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save submission"})
 			return
 		}
+		_ = h.saveProblemCodeDraft(context.Background(), uid, req.ProblemID, req.Language, req.Code)
 		c.JSON(http.StatusOK, gin.H{
 			"submission": SubmissionResponse{
 				ID:          subID,
@@ -1157,6 +1158,7 @@ func (h *Handler) ContestSubmit(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save submission: " + err.Error()})
 		return
 	}
+	_ = h.saveProblemCodeDraft(context.Background(), uid, req.ProblemID, req.Language, req.Code)
 
 	// Scoring:
 	//   all_or_nothing: only AC → full points

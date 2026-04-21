@@ -61,6 +61,7 @@ func (h *Handler) CreateSubmission(c *gin.Context) {
 	}
 
 	userID, _ := c.Get("userID")
+	uid := userID.(int)
 
 	// Fetch problem. A draft problem must look non-existent to non-admins so
 	// they can't submit against something that isn't meant to be visible yet.
@@ -89,12 +90,13 @@ func (h *Handler) CreateSubmission(c *gin.Context) {
 			                              status, passed_count, total_count)
 			 VALUES ($1, $2, $3, $4, 'pending_review', 0, 0)
 			 RETURNING id, submitted_at`,
-			userID, problemID, req.Language, req.Code,
+			uid, problemID, req.Language, req.Code,
 		).Scan(&subID, &submittedAt)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save submission"})
 			return
 		}
+		_ = h.saveProblemCodeDraft(context.Background(), uid, problemID, req.Language, req.Code)
 		c.JSON(http.StatusOK, gin.H{
 			"submission": SubmissionResponse{
 				ID:          subID,
@@ -164,13 +166,14 @@ func (h *Handler) CreateSubmission(c *gin.Context) {
 		`INSERT INTO app.submissions (user_id, problem_id, language, source_code, status, runtime_ms, memory_kb, passed_count, total_count, result_details)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 RETURNING id, submitted_at`,
-		userID, problemID, req.Language, req.Code, result.Status,
+		uid, problemID, req.Language, req.Code, result.Status,
 		runtimeMs, memoryKb, result.PassedCount, result.TotalCount, resultJSON,
 	).Scan(&submissionID, &submittedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save submission: " + err.Error()})
 		return
 	}
+	_ = h.saveProblemCodeDraft(context.Background(), uid, problemID, req.Language, req.Code)
 
 	// Strip stdout/stderr from hidden test cases before returning
 	for i := range result.TestCaseResults {
