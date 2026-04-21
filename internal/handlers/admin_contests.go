@@ -128,36 +128,50 @@ func (h *Handler) AdminListContests(c *gin.Context) {
 	statusFilter := c.Query("status")
 	ctx := context.Background()
 
-	query := `SELECT c.id, c.title, c.start_time, c.end_time, c.is_rated, c.scoring_type,
-	                  c.status, c.created_by, u.username, c.created_at,
-	                  (SELECT COUNT(*) FROM app.contest_problems WHERE contest_id = c.id),
-	                  (SELECT COUNT(*) FROM app.contest_participants WHERE contest_id = c.id),
-	                  c.group_id, COALESCE(g.name, ''), c.proctored, c.grade_visibility
-	           FROM app.contests c
-	           JOIN app.users u ON u.id = c.created_by
-	           LEFT JOIN app.groups g ON g.id = c.group_id
-	           WHERE 1=1`
-	countQuery := `SELECT COUNT(*) FROM app.contests c WHERE 1=1`
-	args := []interface{}{}
-	countArgs := []interface{}{}
-	argIdx := 1
-
-	if statusFilter != "" {
-		clause := ` AND c.status = $` + strconv.Itoa(argIdx)
-		query += clause
-		countQuery += clause
-		args = append(args, statusFilter)
-		countArgs = append(countArgs, statusFilter)
-		argIdx++
+	// Map the requested *derived* status back to a DB predicate. The DB only
+	// stores lifecycle states (draft/upcoming/finalized); running/ended are
+	// derived from timestamps relative to NOW(). Keeping this mapping in SQL
+	// ensures pagination counts are consistent with the visible rows.
+	var filterClause string
+	var filterArgs []interface{}
+	switch statusFilter {
+	case "":
+		// no filter
+	case "draft", "finalized":
+		filterClause = ` AND c.status = $1`
+		filterArgs = []interface{}{statusFilter}
+	case "upcoming":
+		filterClause = ` AND c.status = 'upcoming' AND c.start_time > NOW()`
+	case "running":
+		filterClause = ` AND c.status = 'upcoming' AND c.start_time <= NOW() AND c.end_time >= NOW()`
+	case "ended":
+		filterClause = ` AND c.status = 'upcoming' AND c.end_time < NOW()`
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status filter"})
+		return
 	}
 
+	baseQuery := `SELECT c.id, c.title, c.start_time, c.end_time, c.is_rated, c.scoring_type,
+	                      c.status, c.created_by, u.username, c.created_at,
+	                      (SELECT COUNT(*) FROM app.contest_problems WHERE contest_id = c.id),
+	                      (SELECT COUNT(*) FROM app.contest_participants WHERE contest_id = c.id),
+	                      c.group_id, COALESCE(g.name, ''), c.proctored, c.grade_visibility
+	               FROM app.contests c
+	               JOIN app.users u ON u.id = c.created_by
+	               LEFT JOIN app.groups g ON g.id = c.group_id
+	               WHERE 1=1` + filterClause
+	countQuery := `SELECT COUNT(*) FROM app.contests c WHERE 1=1` + filterClause
+
 	var total int
-	_ = h.DB.QueryRow(ctx, countQuery, countArgs...).Scan(&total)
+	_ = h.DB.QueryRow(ctx, countQuery, filterArgs...).Scan(&total)
 
-	query += ` ORDER BY c.start_time DESC LIMIT $` + strconv.Itoa(argIdx) + ` OFFSET $` + strconv.Itoa(argIdx+1)
-	args = append(args, limit, offset)
+	listArgs := append([]interface{}{}, filterArgs...)
+	nextIdx := len(listArgs) + 1
+	listQuery := baseQuery + ` ORDER BY c.start_time DESC LIMIT $` +
+		strconv.Itoa(nextIdx) + ` OFFSET $` + strconv.Itoa(nextIdx+1)
+	listArgs = append(listArgs, limit, offset)
 
-	rows, err := h.DB.Query(ctx, query, args...)
+	rows, err := h.DB.Query(ctx, listQuery, listArgs...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
@@ -167,12 +181,14 @@ func (h *Handler) AdminListContests(c *gin.Context) {
 	contests := make([]AdminContestSummary, 0)
 	for rows.Next() {
 		var cs AdminContestSummary
+		var dbStatus string
 		if err := rows.Scan(&cs.ID, &cs.Title, &cs.StartTime, &cs.EndTime,
-			&cs.IsRated, &cs.ScoringType, &cs.Status, &cs.CreatedBy,
+			&cs.IsRated, &cs.ScoringType, &dbStatus, &cs.CreatedBy,
 			&cs.CreatorName, &cs.CreatedAt, &cs.ProblemCount, &cs.ParticipantCount,
 			&cs.GroupID, &cs.GroupName, &cs.Proctored, &cs.GradeVisibility); err != nil {
 			continue
 		}
+		cs.Status = AdminContestStatus(dbStatus, cs.StartTime, cs.EndTime)
 		contests = append(contests, cs)
 	}
 
@@ -257,6 +273,7 @@ func (h *Handler) AdminGetContest(c *gin.Context) {
 
 	ctx := context.Background()
 	var cd AdminContestDetail
+	var dbStatus string
 	err = h.DB.QueryRow(ctx,
 		`SELECT c.id, c.title, c.description, c.start_time, c.end_time,
 		        c.is_rated, c.scoring_type, c.status, c.penalty_time_seconds,
@@ -267,13 +284,14 @@ func (h *Handler) AdminGetContest(c *gin.Context) {
 		 LEFT JOIN app.groups g ON g.id = c.group_id
 		 WHERE c.id = $1`, contestID,
 	).Scan(&cd.ID, &cd.Title, &cd.Description, &cd.StartTime, &cd.EndTime,
-		&cd.IsRated, &cd.ScoringType, &cd.Status, &cd.PenaltyTimeSeconds,
+		&cd.IsRated, &cd.ScoringType, &dbStatus, &cd.PenaltyTimeSeconds,
 		&cd.FreezeTimeMinutes, &cd.AllowVirtual, &cd.CreatedBy, &cd.CreatorName, &cd.CreatedAt,
 		&cd.GroupID, &cd.GroupName, &cd.Proctored, &cd.GradeVisibility)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
 	}
+	cd.Status = AdminContestStatus(dbStatus, cd.StartTime, cd.EndTime)
 
 	// Fetch contest problems
 	cd.Problems = make([]AdminContestProblem, 0)
@@ -673,14 +691,24 @@ func (h *Handler) AdminFinalizeContestAdmin(c *gin.Context) {
 	}
 
 	ctx := context.Background()
-	var status string
-	err = h.DB.QueryRow(ctx, `SELECT status FROM app.contests WHERE id = $1`, contestID).Scan(&status)
+	var dbStatus string
+	var startTime, endTime time.Time
+	err = h.DB.QueryRow(ctx,
+		`SELECT status, start_time, end_time FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&dbStatus, &startTime, &endTime)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
 	}
-	if status != "ended" && status != "running" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Only ended or running contests can be finalized"})
+
+	// Derived status is the single source of truth for the admin UI. A
+	// contest can be finalized when it is currently running or has already
+	// ended (but not while still upcoming, draft, or already finalized).
+	derived := AdminContestStatus(dbStatus, startTime, endTime)
+	if derived != "running" && derived != "ended" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Only running or ended contests can be finalized (current: " + derived + ")",
+		})
 		return
 	}
 

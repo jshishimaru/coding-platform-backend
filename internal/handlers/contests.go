@@ -297,7 +297,18 @@ func (h *Handler) predictRatings(contestID int) []RatingPrediction {
 // Helper: contest status
 // ──────────────────────────────────────────────────────────────
 
-func contestStatus(start, end time.Time) string {
+// contestStatus resolves the public (student-facing) status of a contest.
+//
+// The `status` column in the DB is the source of truth for lifecycle states
+// that cannot be derived from time alone (`draft`, `finalized`). For a
+// published contest (`upcoming`), the displayed status is derived from the
+// current time relative to start/end so the UI can show `upcoming`/`live`/
+// `ended` without a background job flipping the column.
+func contestStatus(dbStatus string, start, end time.Time) string {
+	switch dbStatus {
+	case "draft", "finalized":
+		return dbStatus
+	}
 	now := time.Now().UTC()
 	if now.Before(start) {
 		return "upcoming"
@@ -306,6 +317,26 @@ func contestStatus(start, end time.Time) string {
 		return "ended"
 	}
 	return "live"
+}
+
+// AdminContestStatus resolves the admin-facing status of a contest.
+//
+// Admin UI uses `running` (not `live`) for an in-progress contest. Everything
+// else mirrors contestStatus. Having a single helper means list, detail and
+// filter endpoints all agree on what `upcoming`/`running`/`ended` mean.
+func AdminContestStatus(dbStatus string, start, end time.Time) string {
+	switch dbStatus {
+	case "draft", "finalized":
+		return dbStatus
+	}
+	now := time.Now().UTC()
+	if now.Before(start) {
+		return "upcoming"
+	}
+	if now.After(end) {
+		return "ended"
+	}
+	return "running"
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -335,6 +366,7 @@ func (h *Handler) ListContests(c *gin.Context) {
 	//   - group contests where they are a member
 	query := `
 		SELECT c.id, c.title, c.description, c.start_time, c.end_time, c.is_rated,
+		       c.status,
 		       c.group_id, COALESCE(g.name, ''),
 		       c.proctored, c.grade_visibility,
 		       (SELECT COUNT(*) FROM app.contest_participants WHERE contest_id = c.id),
@@ -344,12 +376,17 @@ func (h *Handler) ListContests(c *gin.Context) {
 
 	args := []interface{}{}
 	if roleStr != "admin" {
+		// Non-admins never see unpublished (draft) contests. Group contests
+		// remain restricted to members; global contests are visible to all.
 		query += `
-		WHERE c.group_id IS NULL
+		WHERE c.status <> 'draft'
+		  AND (
+		      c.group_id IS NULL
 		   OR EXISTS (
 		       SELECT 1 FROM app.group_members gm
 		       WHERE gm.group_id = c.group_id AND gm.user_id = $1
-		   )`
+		   )
+		  )`
 		args = append(args, uid)
 	}
 	query += ` ORDER BY c.start_time DESC`
@@ -364,12 +401,13 @@ func (h *Handler) ListContests(c *gin.Context) {
 	contests := make([]ContestSummary, 0)
 	for rows.Next() {
 		var cs ContestSummary
+		var dbStatus string
 		if err := rows.Scan(&cs.ID, &cs.Title, &cs.Description, &cs.StartTime, &cs.EndTime,
-			&cs.IsRated, &cs.GroupID, &cs.GroupName, &cs.Proctored, &cs.GradeVisibility,
+			&cs.IsRated, &dbStatus, &cs.GroupID, &cs.GroupName, &cs.Proctored, &cs.GradeVisibility,
 			&cs.Participants, &cs.ProblemCount); err != nil {
 			continue
 		}
-		cs.Status = contestStatus(cs.StartTime, cs.EndTime)
+		cs.Status = contestStatus(dbStatus, cs.StartTime, cs.EndTime)
 		contests = append(contests, cs)
 	}
 
@@ -394,19 +432,28 @@ func (h *Handler) GetContest(c *gin.Context) {
 	roleStr, _ := role.(string)
 
 	var cd ContestDetail
+	var dbStatus string
 	err = h.DB.QueryRow(context.Background(),
 		`SELECT c.id, c.title, c.description, c.start_time, c.end_time, c.is_rated,
+		        c.status,
 		        c.group_id, COALESCE(g.name, ''), c.proctored, c.grade_visibility
 		 FROM app.contests c
 		 LEFT JOIN app.groups g ON g.id = c.group_id
 		 WHERE c.id = $1`, contestID,
 	).Scan(&cd.ID, &cd.Title, &cd.Description, &cd.StartTime, &cd.EndTime, &cd.IsRated,
-		&cd.GroupID, &cd.GroupName, &cd.Proctored, &cd.GradeVisibility)
+		&dbStatus, &cd.GroupID, &cd.GroupName, &cd.Proctored, &cd.GradeVisibility)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
 	}
-	cd.Status = contestStatus(cd.StartTime, cd.EndTime)
+	cd.Status = contestStatus(dbStatus, cd.StartTime, cd.EndTime)
+
+	// Draft contests are not visible to non-admins — treat as not found to
+	// avoid leaking their existence.
+	if dbStatus == "draft" && roleStr != "admin" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
+		return
+	}
 
 	// Enforce group membership for group contests
 	if cd.GroupID != nil && roleStr != "admin" {
@@ -595,15 +642,22 @@ func (h *Handler) ContestSubmit(c *gin.Context) {
 	// Verify contest exists and is live; pull group info for membership check
 	var startTime, endTime time.Time
 	var groupID *int
+	var dbStatus string
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT start_time, end_time, group_id FROM app.contests WHERE id = $1`, contestID,
-	).Scan(&startTime, &endTime, &groupID)
+		`SELECT start_time, end_time, group_id, status FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&startTime, &endTime, &groupID, &dbStatus)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
 	}
 
-	status := contestStatus(startTime, endTime)
+	// Drafts must not accept submissions, even if their time window is active.
+	// Finalized contests are locked.
+	if dbStatus == "draft" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
+		return
+	}
+	status := contestStatus(dbStatus, startTime, endTime)
 	if status != "live" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Contest is not live"})
 		return
@@ -853,10 +907,17 @@ func (h *Handler) ContestLeaderboard(c *gin.Context) {
 	// Load visibility + group info
 	var gradeVisibility string
 	var groupID *int
+	var dbStatus string
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT grade_visibility, group_id FROM app.contests WHERE id = $1`, contestID,
-	).Scan(&gradeVisibility, &groupID)
+		`SELECT grade_visibility, group_id, status FROM app.contests WHERE id = $1`, contestID,
+	).Scan(&gradeVisibility, &groupID, &dbStatus)
 	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
+		return
+	}
+
+	// Drafts are invisible to non-admins.
+	if dbStatus == "draft" && roleStr != "admin" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Contest not found"})
 		return
 	}
